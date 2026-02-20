@@ -119,15 +119,30 @@ def find_new_log_files(log_dirs: list, state: dict) -> list:
     new_files = []
     for log_dir in log_dirs:
         p = Path(log_dir)
-        if not p.exists():
-            logging.getLogger("wazuh-archiver").warning(
-                f"Log directory not found, skipping: {log_dir}"
+        try:
+            if not p.exists():
+                logging.getLogger("wazuh-archiver").warning(
+                    f"Log directory not found, skipping: {log_dir}"
+                )
+                continue
+        except PermissionError:
+            # Path.exists() propagates PermissionError in Python 3.12+
+            logging.getLogger("wazuh-archiver").error(
+                f"Permission denied: {log_dir}\n"
+                f"  Fix with: setfacl -m u:{os.getlogin() if hasattr(os, 'getlogin') else 'wazuh-archiver'}:x "
+                f"<each parent dir up to {log_dir}>\n"
+                f"  Then:     setfacl -R -m u:wazuh-archiver:rX {log_dir}"
             )
             continue
-        for gz in sorted(p.rglob("*.json.gz")):
-            path_str = str(gz)
-            if path_str not in processed:
-                new_files.append(path_str)
+        try:
+            for gz in sorted(p.rglob("*.json.gz")):
+                path_str = str(gz)
+                if path_str not in processed:
+                    new_files.append(path_str)
+        except PermissionError as e:
+            logging.getLogger("wazuh-archiver").error(
+                f"Permission denied while scanning {log_dir}: {e}"
+            )
     return sorted(new_files)
 
 

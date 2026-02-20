@@ -208,12 +208,31 @@ echo "==> Granting read access to Docker log volume (POSIX ACL)"
 # The -d (default) flag makes the ACL inherit to new files created inside
 # the directory — important because Wazuh creates new .json.gz files every hour.
 if [ -d "${DOCKER_LOG_VOL}" ]; then
+    # Grant traversal (execute) on every parent directory up to the volume.
+    # /var/lib/docker/volumes is typically mode 700 — without x permission
+    # here the service user cannot reach _data even if _data itself is ACL'd.
+    for parent_dir in \
+        /var/lib/docker \
+        /var/lib/docker/volumes \
+        "$(dirname "${DOCKER_LOG_VOL}")"; do
+        if [ -d "${parent_dir}" ]; then
+            setfacl -m "u:${SERVICE_USER}:x" "${parent_dir}"
+            echo "    ACL set: ${SERVICE_USER} → x  on ${parent_dir}"
+        fi
+    done
+
+    # Grant read + execute on the data directory itself (recursive).
+    # The -d (default) flag propagates the ACL to files created in future
+    # by Wazuh log rotation.
     setfacl -R -m  "u:${SERVICE_USER}:rX" "${DOCKER_LOG_VOL}"
     setfacl -R -d -m "u:${SERVICE_USER}:rX" "${DOCKER_LOG_VOL}"
     echo "    ACL set: ${SERVICE_USER} → rX on ${DOCKER_LOG_VOL}"
 else
     echo "    WARNING: ${DOCKER_LOG_VOL} not found — is Wazuh running?"
     echo "    Run these commands once Wazuh has started:"
+    echo "      setfacl -m u:${SERVICE_USER}:x /var/lib/docker"
+    echo "      setfacl -m u:${SERVICE_USER}:x /var/lib/docker/volumes"
+    echo "      setfacl -m u:${SERVICE_USER}:x $(dirname "${DOCKER_LOG_VOL}")"
     echo "      setfacl -R -m  u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
     echo "      setfacl -R -d -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
 fi
