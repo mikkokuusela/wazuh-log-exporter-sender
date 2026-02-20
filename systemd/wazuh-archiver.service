@@ -1,0 +1,38 @@
+[Unit]
+Description=Wazuh Compliance Log Archiver
+Documentation=https://github.com/your-org/wazuh-archiver
+After=network-online.target
+Wants=network-online.target wazuh-archiver.timer
+
+[Service]
+Type=oneshot
+User=wazuh-archiver
+Group=wazuh-archiver
+
+ExecStart=/usr/local/bin/wazuh-archiver --config /etc/wazuh-archiver/archiver.conf
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wazuh-archiver
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Allow write access only to the directories the service actually needs
+ReadWritePaths=/var/lib/wazuh-archiver /var/log/wazuh-archiver /tmp/wazuh-archiver
+
+# Log source directories are read-only
+ReadOnlyPaths=/opt/wazuh/logs /etc/wazuh-archiver
+
+[Install]
+WantedBy=multi-user.target

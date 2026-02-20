@@ -1,0 +1,5 @@
+# No external Python dependencies.
+# Runtime requirements (must exist on the host system):
+#   - Python 3.8+   (stdlib only)
+#   - OpenSSH       (sftp binary, package: openssh-client)
+#   - GnuPG         (gpg binary, package: gnupg — only if signing/encryption enabled)

@@ -1,0 +1,83 @@
+# /etc/wazuh-archiver/archiver.conf
+# Wazuh Compliance Log Archiver — configuration template
+# Copy to /etc/wazuh-archiver/archiver.conf and edit before use.
+
+[wazuh]
+# Comma-separated list of directories to watch for rotated (.json.gz) log files.
+# When Wazuh runs in Docker with a bind-mount, use the HOST path.
+#
+# Default bind-mount path (Vaihtoehto B from the deployment plan):
+#   /opt/wazuh/logs/archives   — all events  (logall_json must be enabled)
+#   /opt/wazuh/logs/alerts     — alert events only
+log_dirs = /opt/wazuh/logs/archives, /opt/wazuh/logs/alerts
+
+# Identifies this Wazuh node in audit records and remote filenames
+node_name = wazuh-node1
+
+
+[sftp]
+# Hostname or IP of the SFTP server
+host = sftp.example.com
+
+# SSH port (default 22)
+port = 22
+
+# SFTP username
+username = wazuh-archiver
+
+# Path to the SSH private key used for authentication (chmod 400, owned by service user)
+# Generate with: ssh-keygen -t ed25519 -f /etc/wazuh-archiver/sftp_key -N ""
+ssh_key_path = /etc/wazuh-archiver/sftp_key
+
+# Remote destination directory (will be created if it does not exist)
+remote_dir = /archive/wazuh
+
+# SSH known_hosts file for strict host-key verification (STRONGLY RECOMMENDED).
+# Generate with:
+#   ssh-keyscan -H sftp.example.com >> /etc/wazuh-archiver/known_hosts
+# Leave empty to use WarningPolicy (not recommended for production).
+known_hosts_file = /etc/wazuh-archiver/known_hosts
+
+
+[gpg]
+# --- Signing ---
+# When enabled, each archive gets a detached armored signature (.sig).
+# The signature proves origin (Wazuh node) and integrity (data unchanged).
+# Supports KATAKRI 2020 non-repudiation and integrity requirements.
+signing = false
+
+# Key ID, fingerprint, or email of the signing key on this machine.
+# Generate a dedicated signing key:
+#   gpg --homedir /etc/wazuh-archiver/gnupg --batch --gen-key /etc/wazuh-archiver/gpg-keygen.conf
+signing_key_id =
+
+# --- Encryption ---
+# When enabled, an encrypted copy of the archive is also uploaded (.gpg).
+# Uses the recipient's PUBLIC key — the private key never needs to be on this server.
+# Supports KATAKRI 2020 confidentiality-at-rest requirements.
+encryption = false
+
+# Fingerprint or email of the recipient's public key (compliance team / escrow).
+# Import the recipient's public key first:
+#   gpg --homedir /etc/wazuh-archiver/gnupg --import recipient-pubkey.asc
+encryption_recipient =
+
+# Path to the gpg binary
+gpg_binary = /usr/bin/gpg
+
+# GPG home directory for this service (must be owned by the service user, chmod 700)
+gpg_homedir = /etc/wazuh-archiver/gnupg
+
+
+[archiver]
+# JSON file that tracks which log files have already been processed.
+# Prevents re-uploading after restarts.
+state_file = /var/lib/wazuh-archiver/state.json
+
+# Rotating audit log (50 MB per file, 12 backups = ~600 MB max)
+# Contains one JSON AUDIT_RECORD line per processed file.
+audit_log = /var/log/wazuh-archiver/audit.log
+
+# Temporary working directory.  Cleaned up after every run.
+# Should be on the same filesystem as the log_dirs for efficient copies.
+temp_dir = /tmp/wazuh-archiver

@@ -1,0 +1,28 @@
+<!--
+  ossec.conf changes required for wazuh-archiver
+  ================================================
+  Add or merge the following into the <global> section of
+  /var/ossec/etc/ossec.conf (inside the Wazuh manager container
+  or directly on the host if using bind-mounts for /var/ossec/etc/).
+
+  After editing, restart the Wazuh manager:
+    docker compose restart wazuh.manager          (Docker deployment)
+    systemctl restart wazuh-manager               (bare-metal)
+-->
+
+<global>
+  <!-- Enable JSON-format archive of ALL events (not just alerts).
+       Without this, /var/ossec/logs/archives/archives.json is not written.
+       WARNING: this significantly increases disk I/O and storage usage.
+       Required for KATAKRI raw-data archival. -->
+  <logall_json>yes</logall_json>
+
+  <!-- Also keep the plain-text syslog archive (optional but harmless) -->
+  <logall>yes</logall>
+
+  <!-- Rotate logs every hour instead of once per day.
+       This produces one ossec-archive-*.json.gz per hour, which aligns
+       with the wazuh-archiver timer that runs at :05 past each hour.
+       Minimum: 10m  Maximum: 1d  Format: Nm / Nh / Nd -->
+  <rotate_interval>1h</rotate_interval>
+</global>

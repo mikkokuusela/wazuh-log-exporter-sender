@@ -1,0 +1,19 @@
+[Unit]
+Description=Wazuh Compliance Log Archiver — hourly timer
+Documentation=https://github.com/your-org/wazuh-archiver
+Requires=wazuh-archiver.service
+
+[Timer]
+# Run 5 minutes past every hour.
+# Wazuh rotates logs at :00 when rotate_interval=1h; the 5-minute offset
+# ensures the rotated file is fully written before we read it.
+OnCalendar=*-*-* *:05:00
+
+# If a run was missed (e.g. system was off), execute immediately on next boot.
+Persistent=true
+
+# Spread load by up to 2 minutes to avoid synchronized execution on multi-node setups.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
