@@ -1,19 +1,25 @@
 [Unit]
-Description=Wazuh Compliance Log Archiver — hourly timer
+Description=Wazuh Compliance Log Archiver — timer
 Documentation=https://github.com/your-org/wazuh-archiver
 Requires=wazuh-archiver.service
 
 [Timer]
-# Run 5 minutes past every hour.
-# Wazuh rotates logs at :00 when rotate_interval=1h; the 5-minute offset
-# ensures the rotated file is fully written before we read it.
-OnCalendar=*-*-* *:05:00
+# Run 30 seconds after each Wazuh log rotation.
+# Adjust to match rotate_interval in ossec.conf:
+#
+#   rotate_interval=10m  →  OnCalendar=*-*-* *:0/10:30
+#   rotate_interval=15m  →  OnCalendar=*-*-* *:0/15:30
+#   rotate_interval=30m  →  OnCalendar=*-*-* *:0/30:30
+#   rotate_interval=1h   →  OnCalendar=*-*-* *:00:30
+#
+OnCalendar=*-*-* *:0/10:30
 
 # If a run was missed (e.g. system was off), execute immediately on next boot.
 Persistent=true
 
-# Spread load by up to 2 minutes to avoid synchronized execution on multi-node setups.
-RandomizedDelaySec=120
+# Small jitter to avoid exact synchronized execution on multi-node setups.
+# Keep well below rotate_interval (e.g. ≤ 20% of the interval).
+RandomizedDelaySec=30
 
 [Install]
 WantedBy=timers.target
