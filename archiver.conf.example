@@ -3,13 +3,29 @@
 # Copy to /etc/wazuh-archiver/archiver.conf and edit before use.
 
 [wazuh]
-# Comma-separated list of directories to watch for rotated (.json.gz) log files.
+# Comma-separated list of directories to watch for rotated log files.
 # When Wazuh runs in Docker with a bind-mount, use the HOST path.
 #
-# Default bind-mount path (Vaihtoehto B from the deployment plan):
-#   /opt/wazuh/logs/archives   — all events  (logall_json must be enabled)
-#   /opt/wazuh/logs/alerts     — alert events only
-log_dirs = /var/lib/docker/volumes/single-node_wazuh_logs/_data/archives, /var/lib/docker/volumes/single-node_wazuh_logs/_data/alerts
+# archives  — all events in JSON (logall_json must be enabled in ossec.conf)
+# alerts    — alert events only in JSON
+# api       — Wazuh API access logs (.log.gz)
+# wazuh     — Wazuh manager internal logs (.log.gz)
+log_dirs = /var/lib/docker/volumes/single-node_wazuh_logs/_data/archives,
+           /var/lib/docker/volumes/single-node_wazuh_logs/_data/alerts,
+           /var/lib/docker/volumes/single-node_wazuh_logs/_data/api,
+           /var/lib/docker/volumes/single-node_wazuh_logs/_data/wazuh
+
+# File patterns to collect (comma-separated glob patterns, matched recursively).
+# *.json.gz — compressed rotated JSON archives (primary Wazuh output)
+# *.json    — uncompressed rotated JSON (also produced by Wazuh; requires min_age_minutes)
+# *.log.gz  — compressed rotated logs (API, internal Wazuh logs)
+file_patterns = *.json.gz, *.json, *.log.gz
+
+# Minimum file age in minutes before an uncompressed file is archived.
+# Prevents capturing files Wazuh is still actively writing to.
+# Set slightly above rotate_interval (e.g. 65 for rotate_interval=1h).
+# Compressed (.gz) files are always safe to archive immediately.
+min_age_minutes = 65
 
 # Identifies this Wazuh node in audit records and remote filenames
 node_name = wazuh-node1

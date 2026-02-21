@@ -109,14 +109,28 @@ def save_state(state_file: str, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def find_new_log_files(log_dirs: list, state: dict) -> list:
+def find_new_log_files(
+    log_dirs: list,
+    state: dict,
+    file_patterns: list,
+    min_age_seconds: int,
+) -> list:
     """
-    Return rotated Wazuh archive files (.json.gz) not yet processed.
-    Searches recursively inside each configured directory.
-    Files are returned sorted by path (oldest date first given Wazuh naming).
+    Return rotated log files not yet processed.
+
+    Searches recursively inside each configured directory for all configured
+    file patterns. Files at the root level of a log directory (e.g.
+    archives.json, alerts.log) are always skipped — they are the
+    currently-active files Wazuh is still writing to.
+
+    For uncompressed files (no .gz suffix), min_age_seconds is enforced so
+    that files Wazuh is actively rotating are not captured mid-write.
+    Compressed (.gz) files are always safe to archive immediately.
     """
     processed = set(state.get("processed_files", []))
     new_files = []
+    now = datetime.now(timezone.utc).timestamp()
+
     for log_dir in log_dirs:
         p = Path(log_dir)
         try:
@@ -134,15 +148,44 @@ def find_new_log_files(log_dirs: list, state: dict) -> list:
                 f"  Then:     setfacl -R -m u:wazuh-archiver:rX {log_dir}"
             )
             continue
+
         try:
-            for gz in sorted(p.rglob("*.json.gz")):
-                path_str = str(gz)
-                if path_str not in processed:
-                    new_files.append(path_str)
+            # Collect candidates across all patterns; use a set to avoid
+            # processing the same file twice if patterns overlap.
+            candidates: set = set()
+            for pattern in file_patterns:
+                for f in p.rglob(pattern):
+                    # Skip root-level active files (archives.json, alerts.log, …)
+                    if f.parent == p:
+                        continue
+                    candidates.add(f)
+
+            for f in sorted(candidates):
+                path_str = str(f)
+
+                if path_str in processed:
+                    continue
+
+                # For uncompressed files, enforce minimum age so we don't
+                # capture files Wazuh is still actively writing to.
+                if not path_str.endswith(".gz") and min_age_seconds > 0:
+                    try:
+                        age = now - f.stat().st_mtime
+                        if age < min_age_seconds:
+                            logging.getLogger("wazuh-archiver").debug(
+                                f"Skipping (too recent, {int(age)}s < {min_age_seconds}s): {path_str}"
+                            )
+                            continue
+                    except OSError:
+                        continue
+
+                new_files.append(path_str)
+
         except PermissionError as e:
             logging.getLogger("wazuh-archiver").error(
                 f"Permission denied while scanning {log_dir}: {e}"
             )
+
     return sorted(new_files)
 
 
@@ -541,7 +584,15 @@ def main() -> None:
     )
     log_dirs = [d.strip() for d in log_dirs_raw.split(",") if d.strip()]
 
-    new_files = find_new_log_files(log_dirs, state)
+    file_patterns_raw = config.get(
+        "wazuh", "file_patterns", fallback="*.json.gz, *.json, *.log.gz"
+    )
+    file_patterns = [p.strip() for p in file_patterns_raw.split(",") if p.strip()]
+
+    min_age_minutes = config.getint("wazuh", "min_age_minutes", fallback=65)
+    min_age_seconds = min_age_minutes * 60
+
+    new_files = find_new_log_files(log_dirs, state, file_patterns, min_age_seconds)
 
     if not new_files:
         logger.info("No new files found — exiting")

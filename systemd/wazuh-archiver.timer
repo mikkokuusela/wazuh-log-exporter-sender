@@ -12,7 +12,7 @@ Requires=wazuh-archiver.service
 #   rotate_interval=30m  →  OnCalendar=*-*-* *:0/30:30
 #   rotate_interval=1h   →  OnCalendar=*-*-* *:00:30
 #
-OnCalendar=*-*-* *:0/10:30
+OnCalendar=*-*-* *:00:30
 
 # If a run was missed (e.g. system was off), execute immediately on next boot.
 Persistent=true
