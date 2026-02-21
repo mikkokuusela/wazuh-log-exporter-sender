@@ -290,6 +290,10 @@ def _ssh_opts(key_path: str, port: int, known_hosts: Optional[str]) -> list:
     production-safe default.  Without a known_hosts file we fall back to
     'accept-new' (records the key on first contact, rejects changes
     thereafter) rather than 'no' (which would accept MITM substitutions).
+
+    UserKnownHostsFile is always set explicitly to avoid SSH falling back
+    to ~/.ssh/known_hosts, which is inaccessible when the systemd service
+    runs with ProtectHome=true.
     """
     opts = [
         "-i", key_path,
@@ -304,7 +308,10 @@ def _ssh_opts(key_path: str, port: int, known_hosts: Optional[str]) -> list:
             "-o", f"UserKnownHostsFile={known_hosts}",
         ]
     else:
-        opts += ["-o", "StrictHostKeyChecking=accept-new"]
+        opts += [
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "UserKnownHostsFile=/var/lib/wazuh-archiver/known_hosts",
+        ]
     return opts
 
 
