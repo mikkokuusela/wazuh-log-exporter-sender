@@ -345,8 +345,32 @@ servers in air-gapped networks.
 
 | Situation | Behaviour |
 |-----------|-----------|
-| `known_hosts_file` configured | `StrictHostKeyChecking=yes` — strict, recommended |
-| No `known_hosts_file` | `StrictHostKeyChecking=accept-new` — records on first contact, rejects changes |
+| `known_hosts_file` configured | `StrictHostKeyChecking=yes` — strict, recommended for production |
+| No `known_hosts_file` | `StrictHostKeyChecking=accept-new` — records on first contact, rejects changes thereafter |
+
+When `known_hosts_file` is not configured, the host key is stored automatically
+to `/var/lib/wazuh-archiver/known_hosts` on first connection. This avoids
+relying on `~/.ssh/known_hosts` which is inaccessible when the systemd service
+runs with `ProtectHome=true`.
+
+**Recommended — configure `known_hosts_file` explicitly:**
+
+```bash
+# Record the SFTP server's host key (replace sftp.example.com with your host)
+sudo ssh-keyscan -H sftp.example.com | sudo tee /etc/wazuh-archiver/known_hosts
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/known_hosts
+sudo chmod 640 /etc/wazuh-archiver/known_hosts
+```
+
+Then set in `archiver.conf`:
+
+```ini
+known_hosts_file = /etc/wazuh-archiver/known_hosts
+```
+
+This enables strict host key verification (`StrictHostKeyChecking=yes`) which
+protects against MITM attacks. Without it, the first connection is accepted
+automatically without any confirmation.
 
 **Transfer integrity:** SSH provides HMAC-SHA2 transport-layer integrity.
 The `.sha256` sidecar file provides content-level integrity that the
