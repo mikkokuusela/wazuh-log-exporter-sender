@@ -62,8 +62,11 @@ encryption_recipient =
 # Path to the gpg binary
 gpg_binary = /usr/bin/gpg
 
-# GPG home directory for this service (must be owned by the service user, chmod 700)
-gpg_homedir = /etc/wazuh-archiver/gnupg
+# GPG home directory for the signing key (must be owned by the service user, chmod 700)
+signing_homedir = /etc/wazuh-archiver/signing/gnupg
+
+# GPG home directory for the encryption key (must be owned by the service user, chmod 700)
+encryption_homedir = /etc/wazuh-archiver/encryption/gnupg
 
 
 [archiver]

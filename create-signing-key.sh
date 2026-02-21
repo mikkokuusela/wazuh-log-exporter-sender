@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-GPG_HOMEDIR="/etc/wazuh-archiver/gnupg"
+GPG_HOMEDIR="/etc/wazuh-archiver/signing/gnupg"
 CONF="/etc/wazuh-archiver/archiver.conf"
 
 # ---------------------------------------------------------------------------
@@ -51,12 +51,13 @@ fi
 # ---------------------------------------------------------------------------
 # Export public key
 # ---------------------------------------------------------------------------
-PUB_KEY="/etc/wazuh-archiver/wazuh-signing-pubkey.asc"
+PUB_KEY="/etc/wazuh-archiver/signing/MOVE_TO_SAFE/pubkey.asc"
 gpg --homedir "${GPG_HOMEDIR}" --export --armor "${FINGERPRINT}" > "${PUB_KEY}"
+chmod 644 "${PUB_KEY}"
 echo "Public key exported: ${PUB_KEY}"
 echo "  → Share this with the compliance team for signature verification"
 
 echo ""
-echo "IMPORTANT: Back up the private key to a physically secured location:"
-echo "  gpg --homedir ${GPG_HOMEDIR} --export-secret-keys --armor ${FINGERPRINT} \\"
-echo "      > /secure/location/wazuh-signing-private-key.asc"
+echo ""
+echo "  Move the public key to the compliance team:"
+echo "    ${PUB_KEY}"

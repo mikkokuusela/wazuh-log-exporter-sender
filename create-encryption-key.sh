@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-GPG_HOMEDIR="/etc/wazuh-archiver/gnupg"
+GPG_HOMEDIR="/etc/wazuh-archiver/encryption/gnupg"
 CONF="/etc/wazuh-archiver/archiver.conf"
 
 # ---------------------------------------------------------------------------
@@ -55,14 +55,15 @@ fi
 # ---------------------------------------------------------------------------
 # Export public key (stays on this machine — used for encryption)
 # ---------------------------------------------------------------------------
-PUB_KEY="/etc/wazuh-archiver/wazuh-encryption-pubkey.asc"
+PUB_KEY="/etc/wazuh-archiver/encryption/pubkey.asc"
 gpg --homedir "${GPG_HOMEDIR}" --export --armor "${FINGERPRINT}" > "${PUB_KEY}"
+chmod 644 "${PUB_KEY}"
 echo "Public key exported: ${PUB_KEY}"
 
 # ---------------------------------------------------------------------------
 # Export private key (must be moved to secure storage — required for decryption)
 # ---------------------------------------------------------------------------
-PRIV_KEY="/etc/wazuh-archiver/wazuh-encryption-private-key.asc"
+PRIV_KEY="/etc/wazuh-archiver/encryption/MOVE_TO_SAFE/private-key.asc"
 gpg --homedir "${GPG_HOMEDIR}" --export-secret-keys --armor "${FINGERPRINT}" > "${PRIV_KEY}"
 chmod 400 "${PRIV_KEY}"
 echo "Private key exported: ${PRIV_KEY}"
@@ -80,5 +81,5 @@ echo "    # Copy to secure location, then:"
 echo "    shred -u ${PRIV_KEY}"
 echo ""
 echo "  To decrypt an archive on the receiving end:"
-echo "    gpg --import wazuh-encryption-private-key.asc"
+echo "    gpg --import private-key.asc"
 echo "    gpg --decrypt ossec-archive-20-14.json.gz.gpg > ossec-archive-20-14.json.gz"

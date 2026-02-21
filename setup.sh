@@ -184,7 +184,14 @@ echo "    Installed: ${BIN_LINK} (interpreter: ${PYTHON_BIN})"
 echo "==> Creating directories"
 # ---------------------------------------------------------------------------
 install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}"
-install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/gnupg"
+# signing key directories
+install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing"
+install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/gnupg"
+install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/MOVE_TO_SAFE"
+# encryption key directories
+install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption"
+install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/gnupg"
+install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/MOVE_TO_SAFE"
 install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_DIR}"
 install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${LOG_DIR}"
 install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${TEMP_DIR}"
@@ -318,7 +325,7 @@ echo "==> Generating GPG keys"
 # ---------------------------------------------------------------------------
 if command -v gpg &>/dev/null; then
     # Signing key — skip if a signing key already exists
-    if gpg --homedir "${CONFIG_DIR}/gnupg" --list-secret-keys 2>/dev/null \
+    if gpg --homedir "${CONFIG_DIR}/signing/gnupg" --list-secret-keys 2>/dev/null \
             | grep -q "^sec"; then
         echo "    Signing key already exists — skipping"
     else
@@ -327,7 +334,7 @@ if command -v gpg &>/dev/null; then
     fi
 
     # Encryption key — skip if an encryption key already exists
-    if gpg --homedir "${CONFIG_DIR}/gnupg" --list-keys 2>/dev/null \
+    if gpg --homedir "${CONFIG_DIR}/encryption/gnupg" --list-keys 2>/dev/null \
             | grep -q "wazuh-archiver-enc"; then
         echo "    Encryption key already exists — skipping"
     else
@@ -371,20 +378,15 @@ echo "     ssh-keyscan -H sftp.example.com >> ${CONFIG_DIR}/known_hosts"
 echo "     chown root:${SERVICE_USER} ${CONFIG_DIR}/known_hosts"
 echo "     chmod 640 ${CONFIG_DIR}/known_hosts"
 echo ""
-echo "4) (Optional) Generate a GPG signing key:"
-echo "     cat > ${CONFIG_DIR}/gpg-keygen.conf << 'GPGEOF'"
-echo "     %no-protection"
-echo "     Key-Type: EdDSA"
-echo "     Key-Curve: Ed25519"
-echo "     Key-Usage: sign"
-echo "     Name-Real: Wazuh Archiver Node1"
-echo "     Name-Email: wazuh-archiver@your-org.fi"
-echo "     Expire-Date: 2y"
-echo "     %commit"
-echo "     GPGEOF"
-echo "     gpg --homedir ${CONFIG_DIR}/gnupg --batch --gen-key ${CONFIG_DIR}/gpg-keygen.conf"
-echo "     gpg --homedir ${CONFIG_DIR}/gnupg --export-secret-keys --armor > /safe/signing-key.asc"
-echo "     chown -R ${SERVICE_USER}:${SERVICE_USER} ${CONFIG_DIR}/gnupg"
+echo "4) GPG keys were generated automatically during setup."
+echo "   Key directories:"
+echo "     ${CONFIG_DIR}/signing/gnupg/           — signing key (stays on this machine)"
+echo "     ${CONFIG_DIR}/signing/MOVE_TO_SAFE/    — signing public key → share with compliance team"
+echo "     ${CONFIG_DIR}/encryption/gnupg/        — encryption key (stays on this machine)"
+echo "     ${CONFIG_DIR}/encryption/MOVE_TO_SAFE/ — encryption private key → move to secure offline storage"
+echo "   To regenerate keys manually:"
+echo "     bash ${SCRIPT_DIR}/create-signing-key.sh"
+echo "     bash ${SCRIPT_DIR}/create-encryption-key.sh"
 echo ""
 echo "5) Apply Wazuh ossec.conf changes (see ossec-conf-snippet.xml):"
 echo "     docker exec -it single-node-wazuh.manager-1 vi /var/ossec/etc/ossec.conf"

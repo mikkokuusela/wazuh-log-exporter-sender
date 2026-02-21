@@ -380,7 +380,20 @@ def process_file(
     """
     node = config.get("wazuh", "node_name", fallback="wazuh-node1")
     gpg_bin = config.get("gpg", "gpg_binary", fallback="/usr/bin/gpg")
-    gpg_home = config.get("gpg", "gpg_homedir", fallback="/etc/wazuh-archiver/gnupg")
+    # Legacy single gpg_homedir — used as fallback if separate homedirs are not set
+    _legacy_home = config.get("gpg", "gpg_homedir", fallback="").strip()
+    if _legacy_home:
+        logger.warning(
+            "gpg.gpg_homedir is deprecated — use gpg.signing_homedir and gpg.encryption_homedir"
+        )
+    signing_home = config.get(
+        "gpg", "signing_homedir",
+        fallback=_legacy_home or "/etc/wazuh-archiver/signing/gnupg",
+    ).strip()
+    encryption_home = config.get(
+        "gpg", "encryption_homedir",
+        fallback=_legacy_home or "/etc/wazuh-archiver/encryption/gnupg",
+    ).strip()
     signing = config.getboolean("gpg", "signing", fallback=False)
     signing_key = config.get("gpg", "signing_key_id", fallback="").strip()
     encryption = config.getboolean("gpg", "encryption", fallback=False)
@@ -420,7 +433,7 @@ def process_file(
                 raise ValueError(
                     "gpg.signing = true but gpg.signing_key_id is not set"
                 )
-            sig = gpg_sign(local, signing_key, gpg_bin, gpg_home, logger)
+            sig = gpg_sign(local, signing_key, gpg_bin, signing_home, logger)
             files.append((sig, fname + ".sig"))
 
         # 3. GPG encryption
@@ -429,7 +442,7 @@ def process_file(
                 raise ValueError(
                     "gpg.encryption = true but gpg.encryption_recipient is not set"
                 )
-            enc = gpg_encrypt(local, enc_recipient, gpg_bin, gpg_home, logger)
+            enc = gpg_encrypt(local, enc_recipient, gpg_bin, encryption_home, logger)
             files.append((enc, fname + ".gpg"))
 
         # 4. SFTP upload + verify
