@@ -25,6 +25,9 @@ Supported platforms: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9.
 - [Configuration file](#configuration-file)
 - [GPG key management](#gpg-key-management)
 - [SFTP connection](#sftp-connection)
+- [WebDAV connection (HTTPS)](#webdav-connection-https)
+- [FTP connection](#ftp-connection)
+- [FTPS connection (explicit TLS)](#ftps-connection-explicit-tls)
 - [Systemd scheduling](#systemd-scheduling)
 - [Testing](#testing)
 - [Monitoring with Zabbix](#monitoring-with-zabbix)
@@ -56,11 +59,11 @@ Wazuh (Docker, single-node)
 │    2. Calculate SHA-256
 │    3. GPG detached signature (.sig)   ← optional
 │    4. GPG encryption (.gpg)           ← optional
-│    5. SFTP transfer (sftp -b batch)
+│    5. Transfer: SFTP / WebDAV HTTPS / FTP / FTPS (configurable)
 │    6. Update state.json
 │    7. Write audit record
 │
-SFTP server
+SFTP / WebDAV server
   /archive/wazuh/
     ossec-archive-20.json.gz          ← omitted if upload_plaintext = false
     ossec-archive-20.json.gz.sha256
@@ -377,6 +380,217 @@ automatically without any confirmation.
 **Transfer integrity:** SSH provides HMAC-SHA2 transport-layer integrity.
 The `.sha256` sidecar file provides content-level integrity that the
 compliance team can verify independently at any time with `sha256sum -c`.
+
+---
+
+## WebDAV connection (HTTPS)
+
+In addition to SFTP, the archiver supports uploading to a WebDAV server over
+HTTPS.  This is the native protocol for Synology DSM (port **5001**) and
+QNAP QTS (port **5006**) NAS devices.
+
+**Zero additional dependencies** — uses Python's stdlib `urllib.request` and
+`ssl` modules.  No external packages are required.
+
+### Transfer mode
+
+Set `mode` in the new `[transfer]` config section:
+
+```ini
+[transfer]
+mode = sftp          # default — existing behaviour unchanged
+# mode = webdav      # WebDAV only
+# mode = sftp,webdav # upload to both simultaneously (redundancy)
+```
+
+### 1. Create the password file
+
+The WebDAV password is stored in a dedicated file (not inline in the config)
+so it never appears in `ps` output or log files:
+
+```bash
+printf '%s' 'your-webdav-password' | sudo tee /etc/wazuh-archiver/webdav_password > /dev/null
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/webdav_password
+sudo chmod 440 /etc/wazuh-archiver/webdav_password
+```
+
+### 2. Obtain the TLS certificate (Synology / QNAP)
+
+Synology DSM and QNAP QTS ship with self-signed certificates by default.
+Export the root CA certificate so the archiver can verify the connection:
+
+**Synology DSM:**
+```
+Control Panel → Security → Certificate → (select certificate) → Export certificate
+```
+Extract `root.pem` from the downloaded archive, then:
+
+```bash
+sudo cp root.pem /etc/wazuh-archiver/webdav_ca.pem
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/webdav_ca.pem
+sudo chmod 640 /etc/wazuh-archiver/webdav_ca.pem
+```
+
+**QNAP QTS:**
+Download from `https://<nas-ip>:8080/cgi-bin/filemanager/utilRequest.cgi?func=get_cacert`
+or export via Control Panel → Certificate & Private Key.
+
+**Test the certificate:**
+```bash
+curl -v --cacert /etc/wazuh-archiver/webdav_ca.pem \
+     https://nas.example.com:5001/
+```
+
+### 3. Configure `archiver.conf`
+
+```ini
+[transfer]
+mode = webdav
+
+[webdav]
+url           = https://nas.example.com:5001
+remote_dir    = /archive/wazuh
+username      = wazuh-archiver
+password_file = /etc/wazuh-archiver/webdav_password
+ca_cert       = /etc/wazuh-archiver/webdav_ca.pem
+```
+
+### 4. Test the WebDAV connection manually
+
+```bash
+# Create directory
+curl -v -u wazuh-archiver:password \
+     --cacert /etc/wazuh-archiver/webdav_ca.pem \
+     -X MKCOL https://nas.example.com:5001/archive/wazuh/
+
+# Upload a test file
+curl -v -u wazuh-archiver:password \
+     --cacert /etc/wazuh-archiver/webdav_ca.pem \
+     -T /tmp/test.txt \
+     https://nas.example.com:5001/archive/wazuh/test.txt
+```
+
+### Host key verification behaviour (WebDAV)
+
+WebDAV over HTTPS relies on TLS for both encryption and server authentication:
+
+| `ca_cert` value | Behaviour |
+|-----------------|-----------|
+| `/path/to/ca.pem` | Verify against custom CA bundle — recommended for self-signed NAS certs |
+| `true` | Verify against system CA store — for publicly trusted certificates |
+| `false` | **Disable verification — never use in production** |
+
+---
+
+## FTP connection
+
+Plain FTP transfers files using a username and password.  Implemented with
+Python's built-in `ftplib` module — no external packages required.
+
+> **Security note:** FTP transmits credentials and file content in cleartext.
+> Use only on closed internal networks or legacy systems where FTPS is
+> unavailable.  The `.sha256` manifest still provides content-level integrity
+> verifiable by the recipient at any time with `sha256sum -c`.
+
+### Configure `archiver.conf`
+
+```ini
+[transfer]
+mode = ftp
+
+[ftp]
+host          = ftp.example.com
+port          = 21
+username      = wazuh-archiver
+password_file = /etc/wazuh-archiver/ftp_password
+remote_dir    = /archive/wazuh
+passive_mode  = true
+```
+
+### Create the password file
+
+```bash
+printf '%s' 'your-ftp-password' | sudo tee /etc/wazuh-archiver/ftp_password > /dev/null
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/ftp_password
+sudo chmod 440 /etc/wazuh-archiver/ftp_password
+```
+
+### Test the connection manually
+
+```bash
+python3 -c "
+import ftplib
+ftp = ftplib.FTP()
+ftp.connect('ftp.example.com', 21, timeout=10)
+ftp.login('wazuh-archiver', open('/etc/wazuh-archiver/ftp_password').read().strip())
+print('PWD:', ftp.pwd())
+ftp.quit()
+"
+```
+
+---
+
+## FTPS connection (explicit TLS)
+
+FTPS explicit (AUTH TLS) connects to port 21 and negotiates TLS after the
+initial handshake.  Both the control channel (credentials) and the data
+channel (file content) are protected by TLS.  Implemented with Python's
+built-in `ftplib.FTP_TLS` — no external packages required.
+
+**Connection flow:**
+```
+1. TCP connect to port 21
+2. login()  — server negotiates AUTH TLS → control channel encrypted
+3. prot_p() — PROT P command → data channel encrypted
+4. set_pasv() — passive data connections (PASV)
+5. storbinary() — upload files
+```
+
+### Configure `archiver.conf`
+
+```ini
+[transfer]
+mode = ftps
+
+[ftps]
+host          = ftps.example.com
+port          = 21
+username      = wazuh-archiver
+password_file = /etc/wazuh-archiver/ftps_password
+remote_dir    = /archive/wazuh
+ca_cert       = true        # or /path/to/ca.pem for self-signed certs
+passive_mode  = true
+```
+
+### Create the password file
+
+```bash
+printf '%s' 'your-ftps-password' | sudo tee /etc/wazuh-archiver/ftps_password > /dev/null
+sudo chown root:wazuh-archiver /etc/wazuh-archiver/ftps_password
+sudo chmod 440 /etc/wazuh-archiver/ftps_password
+```
+
+### Test the connection manually
+
+```bash
+python3 -c "
+import ftplib, ssl
+ctx = ssl.create_default_context()
+# For self-signed: ctx.load_verify_locations('/etc/wazuh-archiver/ftps_ca.pem')
+ftp = ftplib.FTP_TLS(context=ctx)
+ftp.connect('ftps.example.com', 21, timeout=10)
+ftp.login('wazuh-archiver', open('/etc/wazuh-archiver/ftps_password').read().strip())
+ftp.prot_p()
+print('PWD:', ftp.pwd())
+ftp.quit()
+"
+```
+
+| `ca_cert` value | Behaviour |
+|-----------------|-----------|
+| `true` | Verify against system CA store (public certificates) |
+| `/path/to/ca.pem` | Verify against custom CA bundle (self-signed) |
+| `false` | **Disable verification — never use in production** |
 
 ---
 

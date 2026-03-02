@@ -1,5 +1,11 @@
 # No external Python dependencies.
+# All transports use Python stdlib modules only:
+#   - SFTP:   subprocess + system sftp(1) binary
+#   - WebDAV: urllib.request + ssl
+#   - FTP:    ftplib
+#   - FTPS:   ftplib.FTP_TLS + ssl
+#
 # Runtime requirements (must exist on the host system):
 #   - Python 3.8+   (stdlib only)
-#   - OpenSSH       (sftp binary, package: openssh-client)
+#   - OpenSSH       (sftp binary, package: openssh-client — only if transfer.mode includes sftp)
 #   - GnuPG         (gpg binary, package: gnupg — only if signing/encryption enabled)

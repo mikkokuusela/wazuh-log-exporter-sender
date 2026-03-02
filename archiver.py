@@ -18,21 +18,26 @@ Usage:
 """
 
 import argparse
+import base64
 import configparser
+import ftplib
 import hashlib
 import json
 import logging
 import logging.handlers
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 DEFAULT_CONFIG = "/etc/wazuh-archiver/archiver.conf"
 
 
@@ -406,6 +411,259 @@ def sftp_upload_files(
 
 
 # ---------------------------------------------------------------------------
+# WebDAV transfer  (stdlib-only: urllib.request + ssl)
+# ---------------------------------------------------------------------------
+
+
+def _build_ssl_context(ca_cert: str) -> ssl.SSLContext:
+    """
+    Build an SSLContext for HTTPS/FTPS connections.
+
+    ca_cert values:
+      "true"       — verify against the system's trusted CA store (default)
+      "/path/…"    — verify against a custom CA bundle (.pem), e.g. for
+                     self-signed certificates on Synology/QNAP NAS devices
+      "false"      — disable verification entirely (NOT recommended in prod)
+    """
+    if ca_cert.lower() == "false":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    ctx = ssl.create_default_context()
+    if ca_cert.lower() != "true":
+        ctx.load_verify_locations(cafile=ca_cert)
+    return ctx
+
+
+def _webdav_basic_auth(username: str, password: str) -> str:
+    """Return a Basic Authorization header value."""
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {token}"
+
+
+def _webdav_mkcol(
+    url: str,
+    headers: dict,
+    ssl_ctx: ssl.SSLContext,
+    logger: logging.Logger,
+) -> None:
+    """
+    Create a remote directory via WebDAV MKCOL.
+
+    Idempotent: HTTP 405 (Method Not Allowed) and 409 (Conflict) indicate
+    the directory already exists and are treated as success.  Synology DSM
+    returns 405 for an existing collection; QNAP returns 405 or 409.
+    """
+    req = urllib.request.Request(url, method="MKCOL", headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ssl_ctx):
+            logger.debug(f"WebDAV MKCOL created: {url}")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (405, 409, 301, 302):
+            logger.debug(f"WebDAV MKCOL {exc.code} (already exists): {url}")
+        else:
+            raise IOError(
+                f"WebDAV MKCOL failed (HTTP {exc.code}) for {url}: {exc.reason}"
+            ) from exc
+
+
+def webdav_upload_files(
+    url_base: str,
+    remote_dir: str,
+    username: str,
+    password: str,
+    ca_cert: str,
+    files: list,   # list of (local_path, remote_filename) tuples
+    logger: logging.Logger,
+) -> list:
+    """
+    Upload files to a WebDAV server over HTTPS using HTTP Basic Auth.
+
+    Uses only Python stdlib (urllib.request + ssl).  Suitable for
+    Synology DSM (port 5001) and QNAP QTS (port 5006) NAS devices.
+
+    Directory structure is created via MKCOL (idempotent).
+    Each file is uploaded with a PUT request.
+
+    Transfer integrity is provided by TLS (HTTPS); content integrity is
+    provided by the .sha256 manifest uploaded alongside each archive.
+    """
+    ssl_ctx = _build_ssl_context(ca_cert)
+    auth_header = _webdav_basic_auth(username, password)
+    headers = {"Authorization": auth_header}
+
+    # Create remote directory tree (idempotent MKCOL for each path segment)
+    parts = remote_dir.strip("/").split("/")
+    path = ""
+    for part in parts:
+        path = f"{path}/{part}"
+        _webdav_mkcol(f"{url_base.rstrip('/')}{path}", headers, ssl_ctx, logger)
+
+    # Upload files via PUT
+    results = []
+    for local_path, remote_name in files:
+        remote_url = f"{url_base.rstrip('/')}{remote_dir.rstrip('/')}/{remote_name}"
+        file_size = os.path.getsize(local_path)
+
+        with open(local_path, "rb") as f:
+            data = f.read()
+
+        put_headers = {
+            **headers,
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(file_size),
+        }
+        req = urllib.request.Request(
+            remote_url, data=data, method="PUT", headers=put_headers
+        )
+        try:
+            with urllib.request.urlopen(req, context=ssl_ctx) as resp:
+                if resp.status not in (200, 201, 204):
+                    raise IOError(
+                        f"WebDAV PUT returned unexpected status {resp.status}"
+                    )
+        except urllib.error.HTTPError as exc:
+            raise IOError(
+                f"WebDAV PUT failed (HTTP {exc.code}) for {remote_url}: {exc.reason}"
+            ) from exc
+
+        logger.info(f"  Transferred (WebDAV): {remote_name} ({file_size:,} bytes)")
+        results.append(
+            {
+                "remote_name": remote_name,
+                "remote_path": f"{remote_dir}/{remote_name}",
+                "size_bytes": file_size,
+                "verified": True,   # TLS transport-layer integrity
+            }
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
+# FTP / FTPS transfer  (stdlib-only: ftplib)
+# ---------------------------------------------------------------------------
+
+
+def _ftp_mkdir_recursive(
+    ftp: ftplib.FTP,
+    remote_dir: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Create the full remote directory tree via FTP MKD commands.
+
+    Idempotent: a 550 error reply (directory already exists) is silently
+    ignored.  Other permission errors are raised as IOError.
+    """
+    parts = remote_dir.strip("/").split("/")
+    path = ""
+    for part in parts:
+        path = f"{path}/{part}"
+        try:
+            ftp.mkd(path)
+            logger.debug(f"FTP MKD created: {path}")
+        except ftplib.error_perm as exc:
+            # 550 = "Failed to create directory" — usually means it already exists
+            if str(exc)[:3] == "550":
+                logger.debug(f"FTP MKD 550 (exists): {path}")
+            else:
+                raise IOError(f"FTP MKD failed for {path}: {exc}") from exc
+
+
+def ftp_upload_files(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    remote_dir: str,
+    files: list,    # list of (local_path, remote_filename) tuples
+    passive: bool,
+    logger: logging.Logger,
+) -> list:
+    """
+    Upload files via plain FTP using ftplib.FTP (Python stdlib).
+
+    Uses passive mode (PASV) by default — required by most firewalls.
+
+    Note: FTP transmits credentials and file data in cleartext.
+    The .sha256 manifest still provides content-level integrity
+    verifiable by the recipient at any time.
+    """
+    with ftplib.FTP() as ftp:
+        ftp.connect(host, port, timeout=30)
+        ftp.login(username, password)
+        ftp.set_pasv(passive)
+        _ftp_mkdir_recursive(ftp, remote_dir, logger)
+        results = []
+        for local_path, remote_name in files:
+            remote_path = f"{remote_dir.rstrip('/')}/{remote_name}"
+            file_size = os.path.getsize(local_path)
+            with open(local_path, "rb") as f:
+                ftp.storbinary(f"STOR {remote_path}", f)
+            logger.info(f"  Transferred (FTP): {remote_name} ({file_size:,} bytes)")
+            results.append(
+                {
+                    "remote_name": remote_name,
+                    "remote_path": f"{remote_dir}/{remote_name}",
+                    "size_bytes": file_size,
+                    "verified": False,  # FTP has no transport-layer integrity
+                }
+            )
+    return results
+
+
+def ftps_upload_files(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    ca_cert: str,
+    remote_dir: str,
+    files: list,    # list of (local_path, remote_filename) tuples
+    passive: bool,
+    logger: logging.Logger,
+) -> list:
+    """
+    Upload files via explicit FTPS (AUTH TLS on port 21) using ftplib.FTP_TLS.
+
+    Connection flow:
+      1. Plain TCP connect to port 21
+      2. login() — server sends AUTH TLS challenge, control channel upgraded to TLS
+      3. prot_p() — data channel upgraded to TLS (PROT P command)
+      4. set_pasv() — passive data connections (PASV)
+      5. storbinary() — upload files
+
+    Both the control channel (credentials) and data channel (file content)
+    are protected by TLS.  Transfer integrity is guaranteed by TLS (HMAC).
+    Content integrity for the compliance team is provided by the .sha256 manifest.
+    """
+    ssl_ctx = _build_ssl_context(ca_cert)
+    with ftplib.FTP_TLS(context=ssl_ctx) as ftp:
+        ftp.connect(host, port, timeout=30)
+        ftp.login(username, password)
+        ftp.prot_p()          # upgrade data channel to TLS (PROT P)
+        ftp.set_pasv(passive)
+        _ftp_mkdir_recursive(ftp, remote_dir, logger)
+        results = []
+        for local_path, remote_name in files:
+            remote_path = f"{remote_dir.rstrip('/')}/{remote_name}"
+            file_size = os.path.getsize(local_path)
+            with open(local_path, "rb") as f:
+                ftp.storbinary(f"STOR {remote_path}", f)
+            logger.info(f"  Transferred (FTPS): {remote_name} ({file_size:,} bytes)")
+            results.append(
+                {
+                    "remote_name": remote_name,
+                    "remote_path": f"{remote_dir}/{remote_name}",
+                    "size_bytes": file_size,
+                    "verified": True,   # TLS transport-layer integrity
+                }
+            )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Core: process one log file end-to-end
 # ---------------------------------------------------------------------------
 
@@ -422,7 +680,7 @@ def process_file(
       2. Write .sha256 manifest
       3. GPG sign (optional)
       4. GPG encrypt (optional)
-      5. SFTP upload + verify
+      5. Upload via configured transport(s): sftp, webdav, or both
       6. Return audit record
 
     The original file is never modified.
@@ -433,6 +691,14 @@ def process_file(
     Returns a dict with status='success' or status='failed'.
     """
     node = config.get("wazuh", "node_name", fallback="wazuh-node1")
+
+    # Transfer mode: sftp, webdav, or comma-separated combination.
+    # Defaults to "sftp" for backwards compatibility.
+    transfer_mode_raw = config.get("transfer", "mode", fallback="sftp").strip()
+    transfer_modes = {m.strip().lower() for m in transfer_mode_raw.split(",") if m.strip()}
+    if not transfer_modes:
+        transfer_modes = {"sftp"}
+
     gpg_bin = config.get("gpg", "gpg_binary", fallback="/usr/bin/gpg")
     # Legacy single gpg_homedir — used as fallback if separate homedirs are not set
     _legacy_home = config.get("gpg", "gpg_homedir", fallback="").strip()
@@ -459,12 +725,43 @@ def process_file(
             "gpg.upload_plaintext = false requires gpg.encryption = true"
         )
 
-    sftp_host = config.get("sftp", "host")
-    sftp_port = config.getint("sftp", "port", fallback=22)
-    sftp_user = config.get("sftp", "username")
-    sftp_key = config.get("sftp", "ssh_key_path")
-    sftp_known_hosts = config.get("sftp", "known_hosts_file", fallback="").strip() or None
-    sftp_remote = config.get("sftp", "remote_dir")
+    if "sftp" in transfer_modes:
+        sftp_host = config.get("sftp", "host")
+        sftp_port = config.getint("sftp", "port", fallback=22)
+        sftp_user = config.get("sftp", "username")
+        sftp_key = config.get("sftp", "ssh_key_path")
+        sftp_known_hosts = config.get("sftp", "known_hosts_file", fallback="").strip() or None
+        sftp_remote = config.get("sftp", "remote_dir")
+
+    if "webdav" in transfer_modes:
+        webdav_url = config.get("webdav", "url").rstrip("/")
+        webdav_remote = config.get("webdav", "remote_dir")
+        webdav_user = config.get("webdav", "username")
+        webdav_pwfile = config.get("webdav", "password_file")
+        webdav_ca = config.get("webdav", "ca_cert", fallback="true").strip()
+        with open(webdav_pwfile) as _f:
+            webdav_password = _f.read().strip()
+
+    if "ftp" in transfer_modes:
+        ftp_host    = config.get("ftp", "host")
+        ftp_port    = config.getint("ftp", "port", fallback=21)
+        ftp_user    = config.get("ftp", "username")
+        ftp_pwfile  = config.get("ftp", "password_file")
+        ftp_remote  = config.get("ftp", "remote_dir")
+        ftp_passive = config.getboolean("ftp", "passive_mode", fallback=True)
+        with open(ftp_pwfile) as _f:
+            ftp_password = _f.read().strip()
+
+    if "ftps" in transfer_modes:
+        ftps_host    = config.get("ftps", "host")
+        ftps_port    = config.getint("ftps", "port", fallback=21)
+        ftps_user    = config.get("ftps", "username")
+        ftps_pwfile  = config.get("ftps", "password_file")
+        ftps_remote  = config.get("ftps", "remote_dir")
+        ftps_ca      = config.get("ftps", "ca_cert", fallback="true").strip()
+        ftps_passive = config.getboolean("ftps", "passive_mode", fallback=True)
+        with open(ftps_pwfile) as _f:
+            ftps_password = _f.read().strip()
 
     t0 = datetime.now(timezone.utc)
     fname = os.path.basename(source_path)
@@ -509,17 +806,52 @@ def process_file(
             enc = gpg_encrypt(local, enc_recipient, gpg_bin, encryption_home, logger)
             files.append((enc, fname + ".gpg"))
 
-        # 4. SFTP upload + verify
-        upload_results = sftp_upload_files(
-            host=sftp_host,
-            port=sftp_port,
-            username=sftp_user,
-            key_path=sftp_key,
-            known_hosts=sftp_known_hosts,
-            remote_dir=sftp_remote,
-            files=files,
-            logger=logger,
-        )
+        # 4. Upload via configured transport(s)
+        upload_results = []
+        if "sftp" in transfer_modes:
+            upload_results += sftp_upload_files(
+                host=sftp_host,
+                port=sftp_port,
+                username=sftp_user,
+                key_path=sftp_key,
+                known_hosts=sftp_known_hosts,
+                remote_dir=sftp_remote,
+                files=files,
+                logger=logger,
+            )
+        if "webdav" in transfer_modes:
+            upload_results += webdav_upload_files(
+                url_base=webdav_url,
+                remote_dir=webdav_remote,
+                username=webdav_user,
+                password=webdav_password,
+                ca_cert=webdav_ca,
+                files=files,
+                logger=logger,
+            )
+        if "ftp" in transfer_modes:
+            upload_results += ftp_upload_files(
+                host=ftp_host,
+                port=ftp_port,
+                username=ftp_user,
+                password=ftp_password,
+                remote_dir=ftp_remote,
+                files=files,
+                passive=ftp_passive,
+                logger=logger,
+            )
+        if "ftps" in transfer_modes:
+            upload_results += ftps_upload_files(
+                host=ftps_host,
+                port=ftps_port,
+                username=ftps_user,
+                password=ftps_password,
+                ca_cert=ftps_ca,
+                remote_dir=ftps_remote,
+                files=files,
+                passive=ftps_passive,
+                logger=logger,
+            )
 
         t1 = datetime.now(timezone.utc)
         return {
@@ -531,8 +863,17 @@ def process_file(
             "size_bytes": os.path.getsize(source_path),
             "signed": signing,
             "encrypted": encryption,
-            "sftp_host": sftp_host,
-            "remote_dir": sftp_remote,
+            "transport": sorted(transfer_modes),
+            "sftp_host":  sftp_host  if "sftp"  in transfer_modes else None,
+            "webdav_url": webdav_url if "webdav" in transfer_modes else None,
+            "ftp_host":   ftp_host   if "ftp"   in transfer_modes else None,
+            "ftps_host":  ftps_host  if "ftps"  in transfer_modes else None,
+            "remote_dir": (
+                sftp_remote  if "sftp"  in transfer_modes else
+                webdav_remote if "webdav" in transfer_modes else
+                ftp_remote   if "ftp"   in transfer_modes else
+                ftps_remote
+            ),
             "files_uploaded": [r["remote_name"] for r in upload_results],
             "duration_seconds": round((t1 - t0).total_seconds(), 2),
             "status": "success",

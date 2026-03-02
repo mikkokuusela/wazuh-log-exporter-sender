@@ -91,6 +91,113 @@ signing_homedir = /etc/wazuh-archiver/signing/gnupg
 encryption_homedir = /etc/wazuh-archiver/encryption/gnupg
 
 
+[transfer]
+# Which transport(s) to use for uploading files.
+# Options: sftp, webdav, ftp, ftps — or a comma-separated combination.
+# Default: sftp (backwards compatible — no change required for existing deployments)
+#
+# Examples:
+#   mode = sftp           — SSH key-based transfer (default)
+#   mode = ftps           — FTPS explicit (AUTH TLS), username + password
+#   mode = sftp,ftps      — upload to both simultaneously (redundancy)
+mode = sftp
+
+
+[webdav]
+# WebDAV HTTPS destination (required only when transfer.mode includes "webdav").
+#
+# Synology DSM WebDAV port:  5001 (HTTPS)
+# QNAP QTS WebDAV port:      5006 (HTTPS)
+#
+# Include the full URL with protocol and port:
+url = https://nas.example.com:5001
+
+# Remote destination directory (will be created via MKCOL if it does not exist)
+remote_dir = /archive/wazuh
+
+# HTTP Basic Auth username
+username = wazuh-archiver
+
+# Path to a file containing ONLY the password (no trailing newline required).
+# Create with:  printf '%s' 'your-password' > /etc/wazuh-archiver/webdav_password
+# Permissions:  chmod 440 /etc/wazuh-archiver/webdav_password
+#               chown root:wazuh-archiver /etc/wazuh-archiver/webdav_password
+password_file = /etc/wazuh-archiver/webdav_password
+
+# TLS certificate verification:
+#   true            — verify against the system's trusted CA store (for public certs)
+#   /path/to/ca.pem — path to a PEM CA bundle for self-signed or private CA certs
+#   false           — disable verification entirely (NOT recommended in production)
+#
+# Synology/QNAP self-signed certificates:
+#   DSM: Control Panel → Security → Certificate → Export certificate → download root.pem
+#   Then: cp root.pem /etc/wazuh-archiver/webdav_ca.pem
+#         chown root:wazuh-archiver /etc/wazuh-archiver/webdav_ca.pem
+#         chmod 640 /etc/wazuh-archiver/webdav_ca.pem
+ca_cert = /etc/wazuh-archiver/webdav_ca.pem
+
+
+[ftp]
+# Plain FTP — username + password, no encryption.
+# NOTE: Credentials and file data are transmitted in cleartext.
+# Use only on closed internal networks or when FTPS is unavailable.
+
+# Hostname or IP of the FTP server
+host = ftp.example.com
+
+# FTP port (default 21)
+port = 21
+
+# FTP username
+username = wazuh-archiver
+
+# Path to a file containing ONLY the password (no trailing newline required).
+# Create:      printf '%s' 'your-password' > /etc/wazuh-archiver/ftp_password
+# Permissions: chmod 440 /etc/wazuh-archiver/ftp_password
+#              chown root:wazuh-archiver /etc/wazuh-archiver/ftp_password
+password_file = /etc/wazuh-archiver/ftp_password
+
+# Remote destination directory (will be created via MKD if it does not exist)
+remote_dir = /archive/wazuh
+
+# Passive mode (PASV) — strongly recommended, required by most firewalls
+passive_mode = true
+
+
+[ftps]
+# FTPS explicit (AUTH TLS) — username + password, TLS-encrypted.
+# Connection flow: plain TCP connect → login → AUTH TLS on control channel
+#                 → PROT P upgrades data channel to TLS → file transfer
+# Both credentials and file data are protected by TLS.
+
+# Hostname or IP of the FTPS server
+host = ftps.example.com
+
+# FTPS port — explicit mode uses 21 (same as FTP)
+port = 21
+
+# FTPS username
+username = wazuh-archiver
+
+# Path to a file containing ONLY the password (no trailing newline required).
+# Create:      printf '%s' 'your-password' > /etc/wazuh-archiver/ftps_password
+# Permissions: chmod 440 /etc/wazuh-archiver/ftps_password
+#              chown root:wazuh-archiver /etc/wazuh-archiver/ftps_password
+password_file = /etc/wazuh-archiver/ftps_password
+
+# Remote destination directory (will be created via MKD if it does not exist)
+remote_dir = /archive/wazuh
+
+# TLS certificate verification (same syntax as [webdav] ca_cert):
+#   true            — verify against the system's trusted CA store
+#   /path/to/ca.pem — custom CA bundle for self-signed server certificates
+#   false           — disable verification (NOT recommended in production)
+ca_cert = true
+
+# Passive mode (PASV) — strongly recommended, required by most firewalls
+passive_mode = true
+
+
 [archiver]
 # JSON file that tracks which log files have already been processed.
 # Prevents re-uploading after restarts.

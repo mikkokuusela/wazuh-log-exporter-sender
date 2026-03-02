@@ -4,30 +4,14 @@
 # Supports: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9
 # Run as root: sudo bash setup.sh
 #
-# Steps performed:
-#   1.  Detect OS family
-#   2.  Find Python 3.8+
-#   3.  Check runtime dependencies
-#   4.  Create system user
-#   5.  Install script and wrapper binary
-#   6.  Create directories with correct permissions
-#   7.  Install configuration template
-#   8.  Grant read access to Docker log volume (POSIX ACL)
-#   9.  Configure SELinux (RHEL/Rocky only)
-#   10. Install systemd units
-#
-# After running setup.sh you still need to:
-#   a) Edit /etc/wazuh-archiver/archiver.conf
-#   b) Set up the SSH key pair for SFTP (instructions printed at the end)
-#   c) Optionally generate a GPG signing/encryption key (see below)
-#   d) Add ossec-conf-snippet.xml settings to ossec.conf
-#   e) systemctl enable --now wazuh-archiver.timer
+# Jokainen vaihe kysyy käyttäjältä vahvistuksen (Y/n) ennen ajamistaan.
+# Lokihakemistot kysytään interaktiivisesti — ei kovakoodattua oletuspolkua.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE_USER="wazuh-archiver"
-DOCKER_LOG_VOL="/var/lib/docker/volumes/single-node_wazuh_logs/_data"
+DEFAULT_LOG_DIR="/var/lib/docker/volumes/single-node_wazuh_logs/_data"
 INSTALL_DIR="/usr/local/lib/wazuh-archiver"
 BIN_LINK="/usr/local/bin/wazuh-archiver"
 CONFIG_DIR="/etc/wazuh-archiver"
@@ -35,9 +19,122 @@ STATE_DIR="/var/lib/wazuh-archiver"
 LOG_DIR="/var/log/wazuh-archiver"
 TEMP_DIR="/tmp/wazuh-archiver"
 
+# Lopputulos-seuranta yhteenvetoa varten
+SUMMARY=()
+
 # ---------------------------------------------------------------------------
-echo "==> Detecting OS"
+# Apufunktiot
 # ---------------------------------------------------------------------------
+
+# Tulosta vaiheen otsikko
+STEP_NR=0
+print_step() {
+    STEP_NR=$((STEP_NR + 1))
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    printf "  VAIHE %d: %s\n" "${STEP_NR}" "$1"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# Pyydä käyttäjältä Y/N-vahvistus.  Palauttaa 0 = kyllä, 1 = ei.
+confirm() {
+    local reply
+    while true; do
+        printf "\n  %s [Y/n]: " "$1"
+        read -r reply </dev/tty
+        case "${reply,,}" in
+            ''|y|yes) return 0 ;;
+            n|no)     return 1 ;;
+            *) echo "  Anna Y tai N." ;;
+        esac
+    done
+}
+
+# Pyydä käyttäjältä Y/N — oletuksena EI.
+confirm_default_no() {
+    local reply
+    while true; do
+        printf "\n  %s [y/N]: " "$1"
+        read -r reply </dev/tty
+        case "${reply,,}" in
+            ''|n|no)  return 1 ;;
+            y|yes)    return 0 ;;
+            *) echo "  Anna Y tai N." ;;
+        esac
+    done
+}
+
+# Aseta POSIX ACL -oikeudet kohteelle sekä kaikille sen välipolun hakemistoille.
+# $1 = kohdehakemisto (täysi polku), $2 = käyttäjätunnus
+apply_acl_with_parents() {
+    local target="$1"
+    local user="$2"
+
+    # Kerää kaikki välipolut juuren ja kohteen väliltä
+    local dir="${target}"
+    local parents=()
+    while true; do
+        dir="$(dirname "${dir}")"
+        [ "${dir}" = "/" ] && break
+        parents=("${dir}" ${parents[@]+"${parents[@]}"})
+    done
+
+    # Anna execute-oikeus jokaiselle välipolun hakemistolle (läpikulku)
+    for parent in ${parents[@]+"${parents[@]}"}; do
+        [ -d "${parent}" ] || continue
+        setfacl -m "u:${user}:x" "${parent}"
+        echo "    ACL x   → ${parent}"
+    done
+
+    # Anna rekursiivinen luku+execute itse kohteelle
+    setfacl -R  -m "u:${user}:rX" "${target}"
+    setfacl -Rd -m "u:${user}:rX" "${target}"
+    echo "    ACL rX  → ${target}  (rekursiivisesti, myös uudet tiedostot)"
+}
+
+# Tulosta komennot joilla ACL asetetaan myöhemmin kun hakemisto on olemassa
+print_acl_commands() {
+    local target="$1"
+    local user="$2"
+
+    echo "    Komennot kun hakemisto on luotu:"
+    # Laske välipolut
+    local dir="${target}"
+    local parents=()
+    while true; do
+        dir="$(dirname "${dir}")"
+        [ "${dir}" = "/" ] && break
+        parents=("${dir}" ${parents[@]+"${parents[@]}"})
+    done
+    for parent in ${parents[@]+"${parents[@]}"}; do
+        echo "      setfacl -m u:${user}:x ${parent}"
+    done
+    echo "      setfacl -R  -m u:${user}:rX ${target}"
+    echo "      setfacl -Rd -m u:${user}:rX ${target}"
+}
+
+# ---------------------------------------------------------------------------
+# Tarkistukset: täytyy ajaa rootina
+# ---------------------------------------------------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+    echo "VIRHE: Aja tämä skripti root-oikeuksilla: sudo bash setup.sh" >&2
+    exit 1
+fi
+
+echo ""
+echo "============================================================"
+echo "  wazuh-archiver — Asennusohjelma"
+echo "============================================================"
+echo ""
+echo "  Tämä skripti asentaa wazuh-archiverin vaihe vaiheelta."
+echo "  Jokainen vaihe kertoo mitä se tekee ja odottaa vahvistuksesi"
+echo "  ennen kuin mitään muutoksia tehdään järjestelmään."
+
+# ---------------------------------------------------------------------------
+# AUTO: OS-tunnistus
+# ---------------------------------------------------------------------------
+echo ""
+echo "─── Järjestelmätiedot ──────────────────────────────────────"
 OS_FAMILY="unknown"
 OS_NAME="unknown"
 if [ -f /etc/os-release ]; then
@@ -45,15 +142,13 @@ if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS_NAME="${PRETTY_NAME:-unknown}"
     case "${ID:-}" in
-        ubuntu|debian|linuxmint|pop)
-            OS_FAMILY="debian" ;;
-        rhel|centos|rocky|almalinux|fedora)
-            OS_FAMILY="rhel" ;;
+        ubuntu|debian|linuxmint|pop)  OS_FAMILY="debian" ;;
+        rhel|centos|rocky|almalinux|fedora) OS_FAMILY="rhel" ;;
     esac
 fi
-echo "    ${OS_NAME} (family: ${OS_FAMILY})"
+echo "  OS:       ${OS_NAME} (family: ${OS_FAMILY})"
 
-# Package names differ between OS families
+# Paketinhallintakomennot OS-perheen mukaan
 case "${OS_FAMILY}" in
     debian)
         PKG_MANAGER="apt-get install -y"
@@ -61,15 +156,15 @@ case "${OS_FAMILY}" in
         PKG_SFTP="openssh-client"
         PKG_GPG="gnupg"
         PKG_ACL="acl"
-        PKG_SELINUX=""          # not applicable
+        PKG_SELINUX=""
         ;;
     rhel)
         PKG_MANAGER="dnf install -y"
-        PKG_PYTHON="python39"   # Rocky 8 default python3 is 3.6; require 3.9 explicitly
+        PKG_PYTHON="python39"
         PKG_SFTP="openssh-clients"
         PKG_GPG="gnupg2"
         PKG_ACL="acl"
-        PKG_SELINUX="policycoreutils-python-utils"  # provides semanage + audit2allow
+        PKG_SELINUX="policycoreutils-python-utils"
         ;;
     *)
         PKG_MANAGER=""
@@ -82,10 +177,8 @@ case "${OS_FAMILY}" in
 esac
 
 # ---------------------------------------------------------------------------
-echo "==> Finding Python 3.8+"
+# AUTO: Python 3.8+ -etsintä
 # ---------------------------------------------------------------------------
-# Rocky 8 ships Python 3.6 as 'python3'; we need 3.8 minimum.
-# Try specific version binaries first, fall back to generic python3.
 PYTHON_BIN=""
 for candidate in python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
     if command -v "${candidate}" &>/dev/null; then
@@ -98,306 +191,454 @@ for candidate in python3.12 python3.11 python3.10 python3.9 python3.8 python3; d
 done
 
 if [ -z "${PYTHON_BIN}" ]; then
-    echo "    ERROR: Python 3.8+ not found."
     echo ""
+    echo "  VIRHE: Python 3.8+ ei löydy."
     case "${OS_FAMILY}" in
-        rhel)
-            echo "    Install with:"
-            echo "      dnf install -y ${PKG_PYTHON}"
-            echo "    Then re-run setup.sh"
-            ;;
-        debian)
-            echo "    Install with:"
-            echo "      apt-get install -y ${PKG_PYTHON}"
-            echo "    Then re-run setup.sh"
-            ;;
-        *)
-            echo "    Install Python 3.8 or newer and re-run setup.sh"
-            ;;
+        rhel)    echo "  Asenna: dnf install -y ${PKG_PYTHON}" ;;
+        debian)  echo "  Asenna: apt-get install -y ${PKG_PYTHON}" ;;
+        *)       echo "  Asenna Python 3.8 tai uudempi." ;;
     esac
     exit 1
 fi
-
 PYTHON_VER="$(${PYTHON_BIN} -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
-echo "    Using: ${PYTHON_BIN} (${PYTHON_VER})"
+echo "  Python:   ${PYTHON_BIN} (${PYTHON_VER})"
 
 # ---------------------------------------------------------------------------
-echo "==> Checking runtime dependencies"
+# AUTO: Riippuvuustarkistus
 # ---------------------------------------------------------------------------
 MISSING_HARD=0
-MISSING_SOFT=0
 
 check_bin() {
-    local bin="$1"
-    local pkg="$2"
-    local required="$3"   # "required" or "optional"
+    local bin="$1" pkg="$2" required="$3"
     if command -v "${bin}" &>/dev/null; then
-        echo "    ${bin}: OK ($(command -v "${bin}"))"
+        echo "  ${bin}:$(printf '%*s' $((10 - ${#bin})) '')OK  ($(command -v "${bin}"))"
     else
         if [ "${required}" = "required" ]; then
-            echo "    ${bin}: MISSING — install package: ${pkg}"
+            echo "  ${bin}:$(printf '%*s' $((10 - ${#bin})) '')PUUTTUU — asenna: ${PKG_MANAGER} ${pkg}"
             MISSING_HARD=$((MISSING_HARD + 1))
         else
-            echo "    ${bin}: not found (optional — needed only if signing/encryption enabled)"
-            echo "            install with: ${PKG_MANAGER} ${pkg}"
-            MISSING_SOFT=$((MISSING_SOFT + 1))
+            echo "  ${bin}:$(printf '%*s' $((10 - ${#bin})) '')ei löydy (valinnainen — tarvitaan vain GPG-toiminnoille)"
+            echo "            Asenna: ${PKG_MANAGER} ${pkg}"
         fi
     fi
 }
 
-check_bin sftp  "${PKG_SFTP}"  required
-check_bin gpg   "${PKG_GPG}"   optional
-check_bin setfacl "${PKG_ACL}" required
+check_bin sftp    "${PKG_SFTP}"  required
+check_bin setfacl "${PKG_ACL}"  required
+check_bin gpg     "${PKG_GPG}"  optional
 
 if [ "${MISSING_HARD}" -gt 0 ]; then
     echo ""
-    echo "    ERROR: ${MISSING_HARD} required dependency/dependencies missing. Aborting."
+    echo "  VIRHE: ${MISSING_HARD} pakollinen riippuvuus puuttuu. Aborting."
     exit 1
 fi
 
+echo "─────────────────────────────────────────────────────────────"
+
 # ---------------------------------------------------------------------------
-echo "==> Creating system user: ${SERVICE_USER}"
+# VAIHE 1: Järjestelmäkäyttäjä
 # ---------------------------------------------------------------------------
-if ! id "${SERVICE_USER}" &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
-    echo "    Created user ${SERVICE_USER}"
+print_step "Luo järjestelmäkäyttäjä"
+echo ""
+echo "  Luo käyttäjän '${SERVICE_USER}':"
+echo "    - Ei kotihakemistoa"
+echo "    - Ei kirjautumismahdollisuutta (shell: /usr/sbin/nologin)"
+echo "    - Järjestelmäkäyttäjä (UID alle 1000)"
+echo ""
+echo "  Miksi: Tietoturvasyistä skripti ajaa tiedostonsiirrot"
+echo "         pienimmillä mahdollisilla oikeuksilla."
+echo ""
+
+if id "${SERVICE_USER}" &>/dev/null; then
+    echo "  Käyttäjä '${SERVICE_USER}' on jo olemassa — ohitetaan."
+    SUMMARY+=("[✓] Järjestelmäkäyttäjä: jo olemassa"])
 else
-    echo "    User ${SERVICE_USER} already exists"
+    echo "  Komento: useradd --system --no-create-home --shell /usr/sbin/nologin ${SERVICE_USER}"
+    if confirm "Luodaanko käyttäjä '${SERVICE_USER}'?"; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+        echo "  Käyttäjä '${SERVICE_USER}' luotu."
+        SUMMARY+=("[✓] Järjestelmäkäyttäjä '${SERVICE_USER}' luotu")
+    else
+        echo "  Ohitettu — käyttäjää ei luotu."
+        echo "  HUOM: Seuraavat vaiheet saattavat epäonnistua ilman tätä käyttäjää."
+        SUMMARY+=("[✗] Järjestelmäkäyttäjä: ohitettu")
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-echo "==> Installing script"
+# VAIHE 2: Asenna skripti ja käynnistyskomento
 # ---------------------------------------------------------------------------
-install -d "${INSTALL_DIR}"
-install -m 755 "${SCRIPT_DIR}/archiver.py" "${INSTALL_DIR}/archiver.py"
+print_step "Asenna skripti ja käynnistyskomento"
+echo ""
+echo "  Kopioi: ${SCRIPT_DIR}/archiver.py"
+echo "      →   ${INSTALL_DIR}/archiver.py"
+echo ""
+echo "  Luo käynnistyskomento: ${BIN_LINK}"
+echo "    (kutsuu: ${PYTHON_BIN} ${INSTALL_DIR}/archiver.py)"
+echo ""
+echo "  Miksi: Python-binääri kovakoodataan wrapperiin jotta Rocky 8:ssa"
+echo "         käytetään oikeaa versiota (python3 saattaa olla 3.6)."
+echo ""
 
-# Wrapper uses the Python binary found above (important on Rocky 8 where
-# 'python3' might be 3.6 but we need the 3.9 binary we detected earlier).
-cat > "${BIN_LINK}" << EOF
+if confirm "Asennetaanko skripti?"; then
+    install -d "${INSTALL_DIR}"
+    install -m 755 "${SCRIPT_DIR}/archiver.py" "${INSTALL_DIR}/archiver.py"
+    cat > "${BIN_LINK}" << EOF
 #!/usr/bin/env bash
-exec ${PYTHON_BIN} /usr/local/lib/wazuh-archiver/archiver.py "\$@"
+exec ${PYTHON_BIN} ${INSTALL_DIR}/archiver.py "\$@"
 EOF
-chmod 755 "${BIN_LINK}"
-echo "    Installed: ${BIN_LINK} (interpreter: ${PYTHON_BIN})"
-
-# ---------------------------------------------------------------------------
-echo "==> Creating directories"
-# ---------------------------------------------------------------------------
-install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}"
-# signing key directories
-install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing"
-install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/gnupg"
-install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/MOVE_TO_SAFE"
-# encryption key directories
-install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption"
-install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/gnupg"
-install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/MOVE_TO_SAFE"
-install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_DIR}"
-install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${LOG_DIR}"
-install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${TEMP_DIR}"
-echo "    Directories created"
-
-# ---------------------------------------------------------------------------
-echo "==> Installing configuration template"
-# ---------------------------------------------------------------------------
-if [ ! -f "${CONFIG_DIR}/archiver.conf" ]; then
-    install -m 640 -o root -g "${SERVICE_USER}" \
-        "${SCRIPT_DIR}/archiver.conf.example" "${CONFIG_DIR}/archiver.conf"
-    echo "    Written: ${CONFIG_DIR}/archiver.conf — EDIT BEFORE ENABLING"
+    chmod 755 "${BIN_LINK}"
+    echo "  Asennettu: ${BIN_LINK}"
+    SUMMARY+=("[✓] Skripti asennettu: ${BIN_LINK}")
 else
-    echo "    Exists (not overwritten): ${CONFIG_DIR}/archiver.conf"
+    echo "  Ohitettu."
+    SUMMARY+=("[✗] Skripti: ohitettu")
 fi
 
 # ---------------------------------------------------------------------------
-echo "==> Granting read access to Docker log volume (POSIX ACL)"
+# VAIHE 3: Luo hakemistot
 # ---------------------------------------------------------------------------
-# setfacl gives wazuh-archiver read-only access without changing ownership.
-# The -d (default) flag makes the ACL inherit to new files created inside
-# the directory — important because Wazuh creates new .json.gz files every hour.
-if [ -d "${DOCKER_LOG_VOL}" ]; then
-    # Grant traversal (execute) on every parent directory up to the volume.
-    # /var/lib/docker/volumes is typically mode 700 — without x permission
-    # here the service user cannot reach _data even if _data itself is ACL'd.
-    for parent_dir in \
-        /var/lib/docker \
-        /var/lib/docker/volumes \
-        "$(dirname "${DOCKER_LOG_VOL}")"; do
-        if [ -d "${parent_dir}" ]; then
-            setfacl -m "u:${SERVICE_USER}:x" "${parent_dir}"
-            echo "    ACL set: ${SERVICE_USER} → x  on ${parent_dir}"
+print_step "Luo hakemistot"
+echo ""
+echo "  Seuraavat hakemistot luodaan tarvittaessa:"
+echo ""
+printf "  %-55s %s\n" "Polku" "Omistaja / Oikeudet"
+printf "  %-55s %s\n" "─────────────────────────────────────────────────────" "────────────────────"
+printf "  %-55s %s\n" "${CONFIG_DIR}/"                       "root:${SERVICE_USER}  750"
+printf "  %-55s %s\n" "${CONFIG_DIR}/signing/"               "root:${SERVICE_USER}  750"
+printf "  %-55s %s\n" "${CONFIG_DIR}/signing/gnupg/"         "${SERVICE_USER}  700  (GPG-avainrengas)"
+printf "  %-55s %s\n" "${CONFIG_DIR}/signing/MOVE_TO_SAFE/"  "root:${SERVICE_USER}  750"
+printf "  %-55s %s\n" "${CONFIG_DIR}/encryption/"            "root:${SERVICE_USER}  750"
+printf "  %-55s %s\n" "${CONFIG_DIR}/encryption/gnupg/"      "${SERVICE_USER}  700  (GPG-avainrengas)"
+printf "  %-55s %s\n" "${CONFIG_DIR}/encryption/MOVE_TO_SAFE/" "root:${SERVICE_USER}  750"
+printf "  %-55s %s\n" "${STATE_DIR}/"                        "${SERVICE_USER}  750  (tilamuisti)"
+printf "  %-55s %s\n" "${LOG_DIR}/"                          "${SERVICE_USER}  750  (auditointiloki)"
+printf "  %-55s %s\n" "${TEMP_DIR}/"                         "${SERVICE_USER}  750  (väliaikaistiedostot)"
+echo ""
+
+if confirm "Luodaanko hakemistot?"; then
+    install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}"
+    install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing"
+    install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/gnupg"
+    install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/signing/MOVE_TO_SAFE"
+    install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption"
+    install -d -m 700 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/gnupg"
+    install -d -m 750 -o root              -g "${SERVICE_USER}" "${CONFIG_DIR}/encryption/MOVE_TO_SAFE"
+    install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${STATE_DIR}"
+    install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${LOG_DIR}"
+    install -d -m 750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${TEMP_DIR}"
+    echo "  Hakemistot luotu."
+    SUMMARY+=("[✓] Hakemistot luotu")
+else
+    echo "  Ohitettu."
+    SUMMARY+=("[✗] Hakemistot: ohitettu")
+fi
+
+# ---------------------------------------------------------------------------
+# VAIHE 4: Konfiguraatiotiedosto
+# ---------------------------------------------------------------------------
+print_step "Konfiguraatiotiedosto"
+echo ""
+echo "  Lähde:  ${SCRIPT_DIR}/archiver.conf.example"
+echo "  Kohde:  ${CONFIG_DIR}/archiver.conf"
+echo ""
+echo "  TÄRKEÄÄ: Tiedosto on muokattava ennen käyttöönottoa."
+echo "           Vähintään seuraavat kentät täytyy täyttää:"
+echo "             [sftp]   host, username, ssh_key_path, remote_dir"
+echo "             [wazuh]  log_dirs (tarkista että polku täsmää)"
+echo ""
+
+if [ -f "${CONFIG_DIR}/archiver.conf" ]; then
+    echo "  Tiedosto ${CONFIG_DIR}/archiver.conf on jo olemassa."
+    if confirm_default_no "Ylikirjoitetaanko olemassaoleva konfiguraatio?"; then
+        install -m 640 -o root -g "${SERVICE_USER}" \
+            "${SCRIPT_DIR}/archiver.conf.example" "${CONFIG_DIR}/archiver.conf"
+        echo "  Ylikirjoitettu: ${CONFIG_DIR}/archiver.conf"
+        SUMMARY+=("[✓] Konfiguraatio ylikirjoitettu ← MUOKKAA ENNEN KÄYTTÖÄ")
+    else
+        echo "  Ohitettu — olemassaoleva konfiguraatio säilytetty."
+        SUMMARY+=("[~] Konfiguraatio: säilytetty olemassaoleva")
+    fi
+else
+    if confirm "Kopioidaanko konfiguraatiomalli?"; then
+        install -m 640 -o root -g "${SERVICE_USER}" \
+            "${SCRIPT_DIR}/archiver.conf.example" "${CONFIG_DIR}/archiver.conf"
+        echo "  Luotu: ${CONFIG_DIR}/archiver.conf"
+        SUMMARY+=("[✓] Konfiguraatio luotu: ${CONFIG_DIR}/archiver.conf  ← MUOKKAA ENNEN KÄYTTÖÄ")
+    else
+        echo "  Ohitettu."
+        SUMMARY+=("[✗] Konfiguraatio: ohitettu")
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# VAIHE 5: POSIX ACL — luku-oikeudet lokihakemistoihin
+# ---------------------------------------------------------------------------
+print_step "POSIX ACL — luku-oikeudet Wazuh-lokihakemistoihin"
+echo ""
+echo "  Antaa '${SERVICE_USER}'-käyttäjälle luku-oikeuden Wazuh-lokihakemistoihin."
+echo "  Ilman tätä skripti ei pysty lukemaan eikä siirtämään lokitiedostoja."
+echo ""
+echo "  Mitä ACL:t tekevät:"
+echo "    x  (execute) → Jokainen välipolun hakemisto saa läpikulkuoikeuden"
+echo "    rX (read+ex) → Itse lokihakemisto saa rekursiivisen lukuoikeuden"
+echo "    -d (default) → Uudet tiedostot perivät oikeudet automaattisesti"
+echo ""
+echo "  Lokihakemisto voi olla esim.:"
+echo "    /var/lib/docker/volumes/single-node_wazuh_logs/_data  (Docker named volume)"
+echo "    /opt/wazuh/logs                                       (bind mount)"
+echo "    /var/ossec/logs                                       (natiivi Wazuh-asennus)"
+echo "    /data/wazuh/logs,/data/wazuh/alerts                   (useita, pilkulla)"
+echo ""
+printf "  Lokihakemistot [%s]:\n  > " "${DEFAULT_LOG_DIR}"
+read -r LOG_DIRS_INPUT </dev/tty
+LOG_DIRS_INPUT="${LOG_DIRS_INPUT:-${DEFAULT_LOG_DIR}}"
+
+# Muunna pilkulla eroteltu lista taulukoksi
+IFS=',' read -ra LOG_DIRS_ARRAY <<< "${LOG_DIRS_INPUT}"
+# Siivoa välilyönnit
+for i in "${!LOG_DIRS_ARRAY[@]}"; do
+    LOG_DIRS_ARRAY[$i]="${LOG_DIRS_ARRAY[$i]# }"
+    LOG_DIRS_ARRAY[$i]="${LOG_DIRS_ARRAY[$i]% }"
+done
+
+echo ""
+echo "  ACL asetetaan seuraaville hakemistoille:"
+for d in "${LOG_DIRS_ARRAY[@]}"; do
+    if [ -d "${d}" ]; then
+        echo "    ${d}  ✓ (löytyy)"
+    else
+        echo "    ${d}  ✗ (ei löydy — komennot tulostetaan myöhemmin)"
+    fi
+done
+
+if confirm "Asetetaanko ACL-oikeudet?"; then
+    ACL_DIRS_DONE=()
+    ACL_DIRS_MISSING=()
+    for log_dir in "${LOG_DIRS_ARRAY[@]}"; do
+        echo ""
+        echo "  Käsitellään: ${log_dir}"
+        if [ -d "${log_dir}" ]; then
+            apply_acl_with_parents "${log_dir}" "${SERVICE_USER}"
+            ACL_DIRS_DONE+=("${log_dir}")
+        else
+            echo "  VAROITUS: Hakemistoa ei löydy — tulostetaan komennot myöhempää käyttöä varten."
+            print_acl_commands "${log_dir}" "${SERVICE_USER}"
+            ACL_DIRS_MISSING+=("${log_dir}")
         fi
     done
 
-    # Grant read + execute on the data directory itself (recursive).
-    # The -d (default) flag propagates the ACL to files created in future
-    # by Wazuh log rotation.
-    setfacl -R -m  "u:${SERVICE_USER}:rX" "${DOCKER_LOG_VOL}"
-    setfacl -R -d -m "u:${SERVICE_USER}:rX" "${DOCKER_LOG_VOL}"
-    echo "    ACL set: ${SERVICE_USER} → rX on ${DOCKER_LOG_VOL}"
+    if [ ${#ACL_DIRS_DONE[@]} -gt 0 ]; then
+        SUMMARY+=("[✓] ACL asetettu: ${ACL_DIRS_DONE[*]}")
+    fi
+    if [ ${#ACL_DIRS_MISSING[@]} -gt 0 ]; then
+        SUMMARY+=("[!] ACL puuttuu (hakemisto ei olemassa): ${ACL_DIRS_MISSING[*]}")
+    fi
 else
-    echo "    WARNING: ${DOCKER_LOG_VOL} not found — is Wazuh running?"
-    echo "    Run these commands once Wazuh has started:"
-    echo "      setfacl -m u:${SERVICE_USER}:x /var/lib/docker"
-    echo "      setfacl -m u:${SERVICE_USER}:x /var/lib/docker/volumes"
-    echo "      setfacl -m u:${SERVICE_USER}:x $(dirname "${DOCKER_LOG_VOL}")"
-    echo "      setfacl -R -m  u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
-    echo "      setfacl -R -d -m u:${SERVICE_USER}:rX ${DOCKER_LOG_VOL}"
+    echo "  Ohitettu — muista asettaa luku-oikeudet myöhemmin käsin."
+    SUMMARY+=("[✗] ACL: ohitettu")
 fi
 
 # ---------------------------------------------------------------------------
-# SELinux configuration (RHEL / Rocky Linux only)
+# VAIHE 6: SELinux (vain RHEL/Rocky)
 # ---------------------------------------------------------------------------
-# On Rocky 8 SELinux is Enforcing by default. Files written by the Wazuh
-# Docker container carry the label 'svirt_sandbox_file_t'. A systemd service
-# running as a regular user cannot read that label without an explicit policy.
-#
-# Strategy:
-#   1. Use 'semanage fcontext' to declare the Docker volume as 'var_log_t'
-#      (standard host log type that system services are allowed to read).
-#      'restorecon' applies the label to existing files immediately.
-#   2. Default ACLs (set above) make new files inherit the POSIX permissions.
-#   3. New files created by the container will initially have the container
-#      label, but systemd-tmpfiles / restorecon picks up the fcontext policy
-#      on the next run.  If denials still appear, the audit2allow helper
-#      below generates a minimal policy module for the remaining denials.
-# ---------------------------------------------------------------------------
-configure_selinux() {
-    echo "==> Configuring SELinux"
-
-    local se_state
-    se_state="$(getenforce)"
-    echo "    SELinux status: ${se_state}"
-
-    if [ "${se_state}" = "Disabled" ]; then
-        echo "    SELinux is disabled — nothing to do"
-        return
-    fi
-
-    # Ensure semanage and audit2allow are available
-    if ! command -v semanage &>/dev/null; then
-        echo "    Installing ${PKG_SELINUX}..."
-        dnf install -y -q "${PKG_SELINUX}"
-    fi
-    echo "    semanage: OK ($(command -v semanage))"
-
-    # Set the persistent file context for the Docker log volume.
-    # 'semanage fcontext -a' adds a new rule; -m modifies an existing one.
-    # We try -a first and fall back to -m if the rule already exists.
-    local fcontext_pattern="${DOCKER_LOG_VOL}(/.*)?"
-    if semanage fcontext -a -t var_log_t "${fcontext_pattern}" 2>/dev/null; then
-        echo "    fcontext rule added: ${fcontext_pattern} → var_log_t"
-    else
-        semanage fcontext -m -t var_log_t "${fcontext_pattern}"
-        echo "    fcontext rule updated: ${fcontext_pattern} → var_log_t"
-    fi
-
-    # Apply the label to files that already exist in the volume
-    if [ -d "${DOCKER_LOG_VOL}" ]; then
-        restorecon -Rv "${DOCKER_LOG_VOL}" | grep -c 'Relabeled' \
-            | xargs -I{} echo "    restorecon: {} file(s) relabeled"
-    else
-        echo "    Volume not yet present — run 'restorecon -Rv ${DOCKER_LOG_VOL}'"
-        echo "    after Wazuh starts for the first time."
-    fi
-
-    echo ""
-    echo "    NOTE: Files the Wazuh container creates AFTER setup will initially"
-    echo "    carry the container label (svirt_sandbox_file_t). If the archiver"
-    echo "    fails to read new log files, run the audit2allow helper:"
-    echo ""
-    echo "      # 1. Attempt a dry-run so denials are logged:"
-    echo "      sudo -u ${SERVICE_USER} ${BIN_LINK} --dry-run --config ${CONFIG_DIR}/archiver.conf"
-    echo ""
-    echo "      # 2. Generate and install a minimal SELinux policy module:"
-    echo "      ausearch -m avc -c python3 --raw | audit2allow -M wazuh-archiver"
-    echo "      semodule -i wazuh-archiver.pp"
-    echo ""
-    echo "      # 3. Verify:"
-    echo "      semodule -l | grep wazuh"
-}
-
 if [ "${OS_FAMILY}" = "rhel" ]; then
-    configure_selinux
+    print_step "SELinux-konfiguraatio (Rocky/RHEL)"
+    echo ""
+    echo "  Rocky/RHEL:ssa SELinux on oletuksena Enforcing."
+    echo "  Dockerin kirjoittamat tiedostot saavat containerin SELinux-leiman"
+    echo "  (svirt_sandbox_file_t), jota normaalit palvelut eivät voi lukea."
+    echo ""
+    echo "  Toimenpide:"
+    echo "    semanage fcontext  → merkitsee lokihakemistot var_log_t-tyypiksi"
+    echo "    restorecon -Rv     → soveltaa leiman olemassaoleviin tiedostoihin"
+    echo ""
+    echo "  Käytetään samoja lokihakemistoja kuin vaiheessa 5:"
+    for d in "${LOG_DIRS_ARRAY[@]}"; do
+        echo "    ${d}"
+    done
+    echo ""
+
+    if confirm "Konfiguroidaanko SELinux?"; then
+        local_se_state="$(getenforce 2>/dev/null || echo "Unknown")"
+        echo "  SELinux-tila: ${local_se_state}"
+
+        if [ "${local_se_state}" = "Disabled" ]; then
+            echo "  SELinux on pois käytöstä — ei toimenpiteitä."
+            SUMMARY+=("[~] SELinux: pois käytöstä, ohitettu")
+        else
+            if ! command -v semanage &>/dev/null; then
+                echo "  Asennetaan ${PKG_SELINUX}..."
+                dnf install -y -q "${PKG_SELINUX}"
+            fi
+
+            for log_dir in "${LOG_DIRS_ARRAY[@]}"; do
+                fcontext_pattern="${log_dir}(/.*)?"
+                if semanage fcontext -a -t var_log_t "${fcontext_pattern}" 2>/dev/null; then
+                    echo "  fcontext lisätty: ${fcontext_pattern} → var_log_t"
+                else
+                    semanage fcontext -m -t var_log_t "${fcontext_pattern}"
+                    echo "  fcontext päivitetty: ${fcontext_pattern} → var_log_t"
+                fi
+
+                if [ -d "${log_dir}" ]; then
+                    restorecon -Rv "${log_dir}" | grep -c 'Relabeled' \
+                        | xargs -I{} echo "  restorecon: {} tiedostoa uudelleenleimattu"
+                else
+                    echo "  HUOM: ${log_dir} ei löydy — aja 'restorecon -Rv ${log_dir}' Wazuhin käynnistyksen jälkeen."
+                fi
+            done
+
+            echo ""
+            echo "  HUOM: Jos Docker-kontti luo uusia tiedostoja myöhemmin ja"
+            echo "  oikeudet puuttuvat, aja tämä auditointiohjain:"
+            echo "    sudo -u ${SERVICE_USER} ${BIN_LINK} --dry-run --config ${CONFIG_DIR}/archiver.conf"
+            echo "    ausearch -m avc -c python3 --raw | audit2allow -M wazuh-archiver"
+            echo "    semodule -i wazuh-archiver.pp"
+
+            SUMMARY+=("[✓] SELinux konfiguroitu")
+        fi
+    else
+        echo "  Ohitettu."
+        SUMMARY+=("[✗] SELinux: ohitettu")
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-echo "==> Generating GPG keys"
+# VAIHE 7: GPG-avainten generointi
 # ---------------------------------------------------------------------------
-if command -v gpg &>/dev/null; then
-    # Signing key — skip if a signing key already exists
-    if gpg --homedir "${CONFIG_DIR}/signing/gnupg" --list-secret-keys 2>/dev/null \
-            | grep -q "^sec"; then
-        echo "    Signing key already exists — skipping"
-    else
-        echo "    Generating signing key..."
-        bash "${SCRIPT_DIR}/create-signing-key.sh"
-    fi
+print_step "GPG-avainten generointi (valinnainen)"
+echo ""
+echo "  Generoi GPG-avaimet allekirjoitusta ja salausta varten."
+echo "  Tarvitaan vain jos configissa on: signing = true tai encryption = true"
+echo ""
+echo "  Luotavat avaimet:"
+echo "    Allekirjoitusavain (yksityinen): ${CONFIG_DIR}/signing/gnupg/"
+echo "    Allekirjoitusavain (julkinen):   ${CONFIG_DIR}/signing/MOVE_TO_SAFE/pubkey.asc"
+echo "       → Jaa compliance-tiimille allekirjoitusten varmistamista varten"
+echo ""
+echo "    Salausavain (julkinen):          ${CONFIG_DIR}/encryption/gnupg/"
+echo "    Salausavain (yksityinen):        ${CONFIG_DIR}/encryption/MOVE_TO_SAFE/private-key.asc"
+echo "       → SIIRRÄ TURVALLISEEN PAIKKAAN (offline, fyysinen talloite)"
+echo "       → Tämä on ainoa tapa purkaa arkistoitujen tiedostojen salaus"
+echo ""
 
-    # Encryption key — skip if an encryption key already exists
-    if gpg --homedir "${CONFIG_DIR}/encryption/gnupg" --list-keys 2>/dev/null \
-            | grep -q "wazuh-archiver-enc"; then
-        echo "    Encryption key already exists — skipping"
-    else
-        echo "    Generating encryption key pair..."
-        bash "${SCRIPT_DIR}/create-encryption-key.sh"
-    fi
+if ! command -v gpg &>/dev/null; then
+    echo "  gpg ei löydy — ohitetaan automaattisesti."
+    echo "  Asenna gpg ja aja myöhemmin:"
+    echo "    bash ${SCRIPT_DIR}/create-signing-key.sh"
+    echo "    bash ${SCRIPT_DIR}/create-encryption-key.sh"
+    SUMMARY+=("[✗] GPG-avaimet: gpg ei asennettu")
 else
-    echo "    WARNING: gpg not found — skipping key generation"
-    echo "             Install gpg and run manually:"
-    echo "               bash ${SCRIPT_DIR}/create-signing-key.sh"
-    echo "               bash ${SCRIPT_DIR}/create-encryption-key.sh"
+    if confirm "Generoidaanko GPG-avaimet?"; then
+        # Allekirjoitusavain
+        if gpg --homedir "${CONFIG_DIR}/signing/gnupg" --list-secret-keys 2>/dev/null \
+                | grep -q "^sec"; then
+            echo "  Allekirjoitusavain on jo olemassa — ohitetaan."
+        else
+            echo "  Generoidaan allekirjoitusavain..."
+            bash "${SCRIPT_DIR}/create-signing-key.sh"
+        fi
+
+        # Salausavain
+        if gpg --homedir "${CONFIG_DIR}/encryption/gnupg" --list-keys 2>/dev/null \
+                | grep -q "wazuh-archiver-enc"; then
+            echo "  Salausavain on jo olemassa — ohitetaan."
+        else
+            echo "  Generoidaan salausavainpari..."
+            bash "${SCRIPT_DIR}/create-encryption-key.sh"
+        fi
+
+        SUMMARY+=("[✓] GPG-avaimet generoitu")
+    else
+        echo "  Ohitettu — aja tarvittaessa myöhemmin:"
+        echo "    bash ${SCRIPT_DIR}/create-signing-key.sh"
+        echo "    bash ${SCRIPT_DIR}/create-encryption-key.sh"
+        SUMMARY+=("[✗] GPG-avaimet: ohitettu")
+    fi
 fi
 
 # ---------------------------------------------------------------------------
-echo "==> Installing systemd units"
+# VAIHE 8: Systemd-yksiköt
 # ---------------------------------------------------------------------------
-install -m 644 "${SCRIPT_DIR}/systemd/wazuh-archiver.service" \
-    /etc/systemd/system/wazuh-archiver.service
-install -m 644 "${SCRIPT_DIR}/systemd/wazuh-archiver.timer" \
-    /etc/systemd/system/wazuh-archiver.timer
-systemctl daemon-reload
-echo "    Systemd units installed (NOT yet enabled)"
+print_step "Asenna systemd-yksiköt"
+echo ""
+echo "  Kopioitavat tiedostot:"
+echo "    ${SCRIPT_DIR}/systemd/wazuh-archiver.service → /etc/systemd/system/"
+echo "    ${SCRIPT_DIR}/systemd/wazuh-archiver.timer   → /etc/systemd/system/"
+echo ""
+echo "  Ajaa sen jälkeen: systemctl daemon-reload"
+echo ""
+echo "  HUOM: Timer EI aktivoidu automaattisesti."
+echo "        Ota käyttöön manuaalisesti kun konfiguraatio on valmis:"
+echo "          systemctl enable --now wazuh-archiver.timer"
+echo ""
+
+if confirm "Asennetaanko systemd-yksiköt?"; then
+    install -m 644 "${SCRIPT_DIR}/systemd/wazuh-archiver.service" \
+        /etc/systemd/system/wazuh-archiver.service
+    install -m 644 "${SCRIPT_DIR}/systemd/wazuh-archiver.timer" \
+        /etc/systemd/system/wazuh-archiver.timer
+    systemctl daemon-reload
+    echo "  Systemd-yksiköt asennettu (ei vielä aktivoitu)."
+    SUMMARY+=("[✓] Systemd-yksiköt asennettu (timer ei aktivoitu)")
+else
+    echo "  Ohitettu."
+    SUMMARY+=("[✗] Systemd-yksiköt: ohitettu")
+fi
 
 # ---------------------------------------------------------------------------
+# Yhteenveto ja seuraavat vaiheet
+# ---------------------------------------------------------------------------
+echo ""
 echo ""
 echo "============================================================"
-echo "  Installation complete — next steps:"
+echo "  Asennusyhteenveto"
 echo "============================================================"
 echo ""
-echo "1) Edit the config file:"
+for line in "${SUMMARY[@]}"; do
+    echo "  ${line}"
+done
+
+echo ""
+echo "============================================================"
+echo "  Seuraavat vaiheet"
+echo "============================================================"
+echo ""
+echo "1) Muokkaa konfiguraatiotiedostoa:"
 echo "     nano ${CONFIG_DIR}/archiver.conf"
 echo ""
-echo "2) Generate an SSH key pair for SFTP authentication:"
+echo "   Täytä vähintään:"
+echo "     [wazuh]  log_dirs   — Wazuh-lokihakemiston polku"
+echo "     [sftp]   host       — SFTP-palvelimen osoite"
+echo "     [sftp]   username   — SFTP-käyttäjätunnus"
+echo "     [sftp]   ssh_key_path"
+echo "     [sftp]   remote_dir"
+echo ""
+echo "2) Luo SSH-avainpari SFTP-yhteyttä varten:"
 echo "     ssh-keygen -t ed25519 -f ${CONFIG_DIR}/sftp_key -N \"\""
 echo "     chown root:${SERVICE_USER} ${CONFIG_DIR}/sftp_key"
 echo "     chmod 440 ${CONFIG_DIR}/sftp_key"
-echo "     cat ${CONFIG_DIR}/sftp_key.pub   # copy this to the SFTP server"
+echo "     cat ${CONFIG_DIR}/sftp_key.pub   # kopioi SFTP-palvelimelle"
 echo ""
-echo "3) Record the SFTP server's host key:"
-echo "     ssh-keyscan -H sftp.example.com >> ${CONFIG_DIR}/known_hosts"
+echo "3) Tallenna SFTP-palvelimen host key:"
+echo "     ssh-keyscan -H sftp.example.com | tee ${CONFIG_DIR}/known_hosts"
 echo "     chown root:${SERVICE_USER} ${CONFIG_DIR}/known_hosts"
 echo "     chmod 640 ${CONFIG_DIR}/known_hosts"
 echo ""
-echo "4) GPG keys were generated automatically during setup."
-echo "   Key directories:"
-echo "     ${CONFIG_DIR}/signing/gnupg/           — signing key (stays on this machine)"
-echo "     ${CONFIG_DIR}/signing/MOVE_TO_SAFE/    — signing public key → share with compliance team"
-echo "     ${CONFIG_DIR}/encryption/gnupg/        — encryption key (stays on this machine)"
-echo "     ${CONFIG_DIR}/encryption/MOVE_TO_SAFE/ — encryption private key → move to secure offline storage"
-echo "   To regenerate keys manually:"
-echo "     bash ${SCRIPT_DIR}/create-signing-key.sh"
-echo "     bash ${SCRIPT_DIR}/create-encryption-key.sh"
+echo "4) GPG-avainten sijainti (jos generoitiin):"
+echo "     Allekirjoituksen julkinen avain: ${CONFIG_DIR}/signing/MOVE_TO_SAFE/pubkey.asc"
+echo "     Salauksen yksityinen avain:      ${CONFIG_DIR}/encryption/MOVE_TO_SAFE/private-key.asc"
+echo "     → SIIRRÄ YKSITYINEN AVAIN TURVALLISEEN PAIKKAAN"
 echo ""
-echo "5) Apply Wazuh ossec.conf changes (see ossec-conf-snippet.xml):"
+echo "5) Lisää ossec.conf-asetukset (katso ossec-conf-snippet.xml):"
 echo "     docker exec -it single-node-wazuh.manager-1 vi /var/ossec/etc/ossec.conf"
-echo "     # Add: <logall_json>yes</logall_json>"
-echo "     #      <rotate_interval>1h</rotate_interval>"
 echo "     docker compose restart wazuh.manager"
 echo ""
-echo "6) Test with dry-run:"
+echo "6) Testaa dry-runilla:"
 echo "     sudo -u ${SERVICE_USER} ${BIN_LINK} --dry-run --config ${CONFIG_DIR}/archiver.conf"
 echo ""
-echo "7) Enable the timer:"
+echo "7) Aktivoi timer:"
 echo "     systemctl enable --now wazuh-archiver.timer"
 echo "     systemctl list-timers wazuh-archiver.timer"
 echo ""
