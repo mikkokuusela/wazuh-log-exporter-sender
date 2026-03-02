@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 DEFAULT_CONFIG = "/etc/wazuh-archiver/archiver.conf"
 
 
@@ -184,7 +184,7 @@ def find_new_log_files(
                     except OSError:
                         continue
 
-                new_files.append(path_str)
+                new_files.append((path_str, log_dir))
 
         except PermissionError as e:
             logging.getLogger("wazuh-archiver").error(
@@ -668,8 +668,14 @@ def ftps_upload_files(
 # ---------------------------------------------------------------------------
 
 
+def _effective_dir(base: str, subdir: str) -> str:
+    """Return base/subdir when subdir is non-empty, otherwise just base."""
+    return f"{base}/{subdir}" if subdir else base
+
+
 def process_file(
     source_path: str,
+    log_dir: str,
     config: configparser.ConfigParser,
     work_dir: str,
     logger: logging.Logger,
@@ -764,7 +770,9 @@ def process_file(
             ftps_password = _f.read().strip()
 
     t0 = datetime.now(timezone.utc)
-    fname = os.path.basename(source_path)
+    rel_path   = os.path.relpath(source_path, log_dir)   # e.g. "2026/Feb/ossec-archive-22.json"
+    rel_subdir = os.path.dirname(rel_path)                # e.g. "2026/Feb"
+    fname      = os.path.basename(rel_path)               # e.g. "ossec-archive-22.json"
 
     # Isolated working directory — cleaned up even on failure
     wd = tempfile.mkdtemp(dir=work_dir, prefix="arch-")
@@ -815,14 +823,14 @@ def process_file(
                 username=sftp_user,
                 key_path=sftp_key,
                 known_hosts=sftp_known_hosts,
-                remote_dir=sftp_remote,
+                remote_dir=_effective_dir(sftp_remote, rel_subdir),
                 files=files,
                 logger=logger,
             )
         if "webdav" in transfer_modes:
             upload_results += webdav_upload_files(
                 url_base=webdav_url,
-                remote_dir=webdav_remote,
+                remote_dir=_effective_dir(webdav_remote, rel_subdir),
                 username=webdav_user,
                 password=webdav_password,
                 ca_cert=webdav_ca,
@@ -835,7 +843,7 @@ def process_file(
                 port=ftp_port,
                 username=ftp_user,
                 password=ftp_password,
-                remote_dir=ftp_remote,
+                remote_dir=_effective_dir(ftp_remote, rel_subdir),
                 files=files,
                 passive=ftp_passive,
                 logger=logger,
@@ -847,7 +855,7 @@ def process_file(
                 username=ftps_user,
                 password=ftps_password,
                 ca_cert=ftps_ca,
-                remote_dir=ftps_remote,
+                remote_dir=_effective_dir(ftps_remote, rel_subdir),
                 files=files,
                 passive=ftps_passive,
                 logger=logger,
@@ -868,11 +876,12 @@ def process_file(
             "webdav_url": webdav_url if "webdav" in transfer_modes else None,
             "ftp_host":   ftp_host   if "ftp"   in transfer_modes else None,
             "ftps_host":  ftps_host  if "ftps"  in transfer_modes else None,
-            "remote_dir": (
+            "remote_dir": _effective_dir(
                 sftp_remote  if "sftp"  in transfer_modes else
                 webdav_remote if "webdav" in transfer_modes else
                 ftp_remote   if "ftp"   in transfer_modes else
-                ftps_remote
+                ftps_remote,
+                rel_subdir,
             ),
             "files_uploaded": [r["remote_name"] for r in upload_results],
             "duration_seconds": round((t1 - t0).total_seconds(), 2),
@@ -967,14 +976,14 @@ def main() -> None:
 
     ok = fail = 0
 
-    for path in new_files:
+    for path, log_dir in new_files:
         logger.info(f"Processing: {path}")
 
         if args.dry_run:
             logger.info("  [dry-run] skipping upload")
             continue
 
-        rec = process_file(path, config, work_dir, logger)
+        rec = process_file(path, log_dir, config, work_dir, logger)
 
         # Write structured audit record to the audit log
         logger.info(f"AUDIT_RECORD {json.dumps(rec)}")

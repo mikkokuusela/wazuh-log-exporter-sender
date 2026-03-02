@@ -1,9 +1,10 @@
-# wazuh-log-exporter-sender
+# wazuh-archiver
 
 Compliance log archival tool for Wazuh single-node deployments.
 
 Collects Wazuh's rotated log files, optionally signs and/or encrypts
-them with GPG, and transfers them to an SFTP server with a full audit trail.
+them with GPG, and transfers them to a remote store with a full audit trail.
+Supports SFTP, WebDAV HTTPS, FTP, and FTPS — individually or in combination.
 Designed to satisfy common security compliance requirements around log
 integrity, non-repudiation, and confidentiality (ISO 27001, NIS2, NIST
 SP 800-92, and similar frameworks).
@@ -31,7 +32,7 @@ Supported platforms: Debian/Ubuntu, Rocky Linux 8/9, RHEL 8/9, AlmaLinux 8/9.
 - [Systemd scheduling](#systemd-scheduling)
 - [Testing](#testing)
 - [Monitoring with Zabbix](#monitoring-with-zabbix)
-- [Files written to the SFTP store](#files-written-to-the-sftp-store)
+- [Files written to the remote store](#files-written-to-the-remote-store)
 - [Compliance coverage](#compliance-coverage)
 - [Troubleshooting](#troubleshooting)
 
@@ -63,12 +64,16 @@ Wazuh (Docker, single-node)
 │    6. Update state.json
 │    7. Write audit record
 │
-SFTP / WebDAV server
+SFTP / WebDAV / FTP / FTPS server
   /archive/wazuh/
-    ossec-archive-20.json.gz          ← omitted if upload_plaintext = false
-    ossec-archive-20.json.gz.sha256
-    ossec-archive-20.json.gz.sig    ← if signing = true
-    ossec-archive-20.json.gz.gpg    ← if encryption = true
+    2026/Feb/
+      ossec-archive-20.json.gz          ← omitted if upload_plaintext = false
+      ossec-archive-20.json.gz.sha256
+      ossec-archive-20.json.gz.sig    ← if signing = true
+      ossec-archive-20.json.gz.gpg    ← if encryption = true
+    2026/Mar/
+      ossec-archive-20.json.gz
+      ...
 ```
 
 ---
@@ -262,6 +267,9 @@ upload_plaintext     = true                              # set false to send onl
 gpg_binary           = /usr/bin/gpg
 signing_homedir      = /etc/wazuh-archiver/signing/gnupg
 encryption_homedir   = /etc/wazuh-archiver/encryption/gnupg
+
+[transfer]
+mode = sftp          # sftp | webdav | ftp | ftps | comma-separated combination
 
 [archiver]
 state_file = /var/lib/wazuh-archiver/state.json
@@ -745,16 +753,24 @@ This is sufficient to diagnose the problem without logging into the server.
 
 ---
 
-## Files written to the SFTP store
+## Files written to the remote store
+
+The remote directory structure mirrors Wazuh's source layout (`YYYY/Mon/`),
+so files from different months never overwrite each other regardless of
+filename.
 
 Each processed file produces the following sidecar files:
 
 ```
 /archive/wazuh/
-  ossec-archive-20.json.gz          upload_plaintext=true (default) — compressed log data
-  ossec-archive-20.json.gz.sha256   always   — SHA-256 integrity manifest
-  ossec-archive-20.json.gz.sig      optional — GPG detached signature (signing=true)
-  ossec-archive-20.json.gz.gpg      optional — GPG-encrypted copy (encryption=true)
+  2026/Feb/
+    ossec-archive-20.json.gz          upload_plaintext=true (default) — compressed log data
+    ossec-archive-20.json.gz.sha256   always   — SHA-256 integrity manifest
+    ossec-archive-20.json.gz.sig      optional — GPG detached signature (signing=true)
+    ossec-archive-20.json.gz.gpg      optional — GPG-encrypted copy (encryption=true)
+  2026/Mar/
+    ossec-archive-20.json.gz
+    ...
 ```
 
 Set `upload_plaintext = false` (requires `encryption = true`) to upload only the
