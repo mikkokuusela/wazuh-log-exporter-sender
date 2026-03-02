@@ -25,7 +25,7 @@ Subkey-Curve: Curve25519
 Subkey-Usage: encrypt
 Name-Real: Wazuh Archiver Encryption
 Name-Email: wazuh-archiver-enc@wazuh-node1
-Expire-Date: 2y
+Expire-Date: 0
 %commit
 EOF
 

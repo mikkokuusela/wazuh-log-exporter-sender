@@ -21,7 +21,7 @@ Key-Curve: Ed25519
 Key-Usage: sign
 Name-Real: Wazuh Archiver Signing
 Name-Email: wazuh-archiver-signing@wazuh-node1
-Expire-Date: 2y
+Expire-Date: 0
 %commit
 EOF
 
