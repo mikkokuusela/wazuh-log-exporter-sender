@@ -629,7 +629,8 @@ are already required by other transports.
 
 ```bash
 # Add the MinIO alias (run once)
-mc alias set myminio https://minio.example.com:9000 admin adminpassword
+# Add --insecure if MinIO uses a self-signed certificate
+mc alias set myminio https://minio.example.com:9000 admin adminpassword --insecure
 
 # Create the bucket
 mc mb myminio/wazuh-logs
@@ -729,7 +730,8 @@ sudo -u wazuh-archiver wazuh-archiver \
   --config /etc/wazuh-archiver/archiver.conf
 
 # Verify upload with mc (MinIO client)
-mc alias set myminio https://minio.example.com:9000 ACCESS_KEY SECRET_KEY
+# Add --insecure if MinIO uses a self-signed certificate
+mc alias set myminio https://minio.example.com:9000 ACCESS_KEY SECRET_KEY --insecure
 mc ls --recursive myminio/wazuh-logs/archive/wazuh/
 ```
 
